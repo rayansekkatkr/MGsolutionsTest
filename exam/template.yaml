@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  v1.1 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Capacity is driven by two plain
+  CloudWatch alarms on ALB request rate (high traffic -> MaxHosts, quiet traffic -> BaseHosts),
+  applied to both the Auto Scaling group and the ECS service so hosts and tasks stay 1:1.
+
+Parameters:
+  VpcId: {Type: "AWS::EC2::VPC::Id"}
+  SubnetIds: {Type: "List<AWS::EC2::Subnet::Id>"}
+  ClientSecurityGroupId: {Type: "AWS::EC2::SecurityGroup::Id"}
+  EndpointSecurityGroupId: {Type: "AWS::EC2::SecurityGroup::Id"}
+  S3PrefixListId: {Type: String}
+  RunId: {Type: String}
+  TaskExecutionRoleArn: {Type: String}
+  InstanceProfileArn: {Type: String}
+  ReferenceImageUri: {Type: String}
+  EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
+  BaseHosts:
+    Type: Number
+    Default: 2
+    Description: GPU hosts at creation and whenever traffic is quiet (2 = one host can be killed at any time)
+  MaxHosts:
+    Type: Number
+    Default: 8
+    Description: Peak GPU hosts (exam cap is 8)
+  ScaleOutRequestsPerMinute:
+    Type: Number
+    Default: 200
+    Description: ALB requests/min above which the fleet jumps to MaxHosts (quiet phases send 100/min, stage 2 sends 1,000/min)
+  ScaleInRequestsPerMinute:
+    Type: Number
+    Default: 150
+    Description: ALB requests/min below which the fleet returns to BaseHosts (must stay below ScaleOutRequestsPerMinute)
+
+Resources:
+  # ---------------- Security groups: client -> ALB -> tasks; hosts reach AWS endpoints only ----------------
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-alb"
+      GroupDescription: entry point - internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ClientSecurityGroupId}
+  ServiceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-service"
+      GroupDescription: inference tasks - no outbound
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 127.0.0.1/32}
+  HostSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-host"
+      GroupDescription: GPU hosts - AWS endpoints and S3 only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSecurityGroupId}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId}
+  AlbToService:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      DestinationSecurityGroupId: !Ref ServiceSg
+  ServiceFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSg
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSg
+
+  # ---------------- GPU hosts ----------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "exam-r${RunId}-cluster"
+      ClusterSettings:
+        - {Name: containerInsights, Value: enabled}
+  HostTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "exam-r${RunId}-gpu"
+      LaunchTemplateData:
+        ImageId: !Ref EcsGpuAmiId
+        InstanceType: g6.xlarge
+        IamInstanceProfile: {Arn: !Ref InstanceProfileArn}
+        SecurityGroupIds: [!Ref HostSg]
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+        Monitoring: {Enabled: true}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 100, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat >> /etc/ecs/ecs.config <<EOF
+            ECS_CLUSTER=exam-r${RunId}-cluster
+            ECS_ENABLE_GPU_SUPPORT=true
+            ECS_AWSVPC_BLOCK_IMDS=true
+            ECS_DISABLE_PRIVILEGED=true
+            ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+            EOF
+  HostGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
+      MinSize: !Ref BaseHosts
+      MaxSize: !Ref MaxHosts
+      DesiredCapacity: !Ref BaseHosts
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 0
+      DefaultInstanceWarmup: 60
+      VPCZoneIdentifier: !Ref SubnetIds
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: [GroupInServiceInstances]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref HostTemplate
+        Version: !GetAtt HostTemplate.LatestVersionNumber
+
+  # ---------------- Inference service (container settings = reference design values) ----------------
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/exam-run/r${RunId}/inference"
+      RetentionInDays: 7
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "exam-r${RunId}-inference"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !Ref TaskExecutionRoleArn
+      ContainerDefinitions:
+        - Name: inference
+          Image: !Ref ReferenceImageUri
+          Essential: true
+          User: "10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
+          ResourceRequirements: [{Type: GPU, Value: "1"}]
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: {Drop: [ALL]}
+            SharedMemorySize: 1024
+            Tmpfs: [{ContainerPath: /tmp, Size: 2048, MountOptions: [rw, nosuid, nodev]}]
+          HealthCheck:
+            Command: [CMD-SHELL, "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=3)\""]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 300
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: inference
+              mode: non-blocking
+              max-buffer-size: 4m
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "exam-r${RunId}-alb"
+      Scheme: internal
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSg]
+  Targets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "exam-r${RunId}-tg"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "15"}
+        - {Key: load_balancing.algorithm.type, Value: least_outstanding_requests}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref Targets}
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, HostGroup]
+    Properties:
+      ServiceName: !Sub "exam-r${RunId}-inference"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref Task
+      LaunchType: EC2
+      DesiredCount: !Ref BaseHosts
+      HealthCheckGracePeriodSeconds: 300
+      PlacementConstraints:
+        - Type: distinctInstance
+      PlacementStrategies:
+        - {Type: spread, Field: "attribute:ecs.availability-zone"}
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref ServiceSg]
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - {ContainerName: inference, ContainerPort: 8080, TargetGroupArn: !Ref Targets}
+
+  # ---------------- Scaling: the same two alarms drive hosts (ASG) and tasks (ECS) ----------------
+  # The load profile is steep (x10 per stage) while a GPU host needs minutes to boot and pull
+  # the image, so per-request target tracking always lags. Two fixed operating points instead:
+  #   traffic > ScaleOutRequestsPerMinute -> MaxHosts   (first sign of the ramp)
+  #   traffic < ScaleInRequestsPerMinute  -> BaseHosts  (quiet start and cool-down)
+  # The quiet alarm is also in ALARM at the start of the run; there it sets the capacity the
+  # stack was created with, so it is a no-op. The two thresholds never overlap.
+  HostScaleOut:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      MetricAggregationType: Maximum
+      StepAdjustments:
+        - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref MaxHosts}
+  HostScaleIn:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      MetricAggregationType: Maximum
+      StepAdjustments:
+        - {MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref BaseHosts}
+  TaskScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      MinCapacity: !Ref BaseHosts
+      MaxCapacity: !Ref MaxHosts
+  TaskScaleOut:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "exam-r${RunId}-tasks-out"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref TaskScaling
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        MetricAggregationType: Maximum
+        Cooldown: 0
+        StepAdjustments:
+          - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref MaxHosts}
+  TaskScaleIn:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "exam-r${RunId}-tasks-in"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref TaskScaling
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        MetricAggregationType: Maximum
+        Cooldown: 0
+        StepAdjustments:
+          - {MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref BaseHosts}
+  TrafficHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-traffic-high"
+      AlarmDescription: Load ramp detected - go to peak capacity
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref ScaleOutRequestsPerMinute
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref HostScaleOut, !Ref TaskScaleOut]
+  TrafficQuietAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-traffic-quiet"
+      AlarmDescription: Traffic is at the quiet level - run on base capacity
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref ScaleInRequestsPerMinute
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref HostScaleIn, !Ref TaskScaleIn]
+
+  # ---------------- Observability ----------------
+  UnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-unhealthy-targets"
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt Targets.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-5xx"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "exam-r${RunId}-overview"
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Requests / 5xx", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Target response time", "period": 60,
+            "metrics": [["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb.LoadBalancerFullName}", {"stat": "p50"}],
+                        ["...", {"stat": "p95"}], ["...", {"stat": "p99"}]]}},
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts", "stat": "Maximum", "period": 60,
+            "metrics": [["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${HostGroup}"],
+                        ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}}
+        ]}
+
+Outputs:
+  EndpointUrl:
+    Value: !Sub "http://${Alb.DNSName}"
