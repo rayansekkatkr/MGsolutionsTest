@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  v3 - internal ALB -> edge proxies (Fargate) -> internal ALB -> ECS (EC2 GPU, 1 task per host).
-  The edge proxies send a request again, to another host, when the host it went to stops
-  answering, so that losing a GPU host does not lose requests. Each GPU task runs a batching
-  inference server (same models and weights as the reference, TensorRT engines) behind an HAProxy
-  sidecar. Under overload the server answers the freshest requests and the rest is refused at
-  once. The fleet starts at full size and shrinks to IdleHosts once a peak is over.
+  v3 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Each task runs a batching inference
+  server (same models and weights as the reference, fp16 backbones, several photos per forward
+  pass) behind an HAProxy sidecar that caps what reaches it. Under overload the server answers the
+  freshest requests and turns the rest away at once. The fleet starts at full size; after a peak,
+  when the tasks report that demand is back to a small fraction of capacity, it shrinks to IdleHosts
+  (zero by default: nothing but the load balancer is paid for while the service is at rest).
 
 Parameters:
   VpcId: {Type: "AWS::EC2::VPC::Id"}
@@ -30,39 +30,46 @@ Parameters:
     Description: GPU hosts at creation and under load (exam cap is 8). One task per host
   IdleHosts:
     Type: Number
-    Default: 1
-    Description: GPU hosts kept once a peak is over and demand is a small fraction of capacity
+    Default: 0
+    Description: >-
+      GPU hosts kept once a peak is over and demand is a small fraction of capacity. 0 puts the
+      service to sleep (requests are then refused until hosts are started again, which takes
+      minutes); 1 keeps it answering a trickle of requests at the price of one host
   MaxBatch:
     Type: Number
-    Default: 3
-    Description: Photos per forward pass at most
+    Default: 2
+    Description: >-
+      Photos per forward pass at most. Measured on an L4 under overload: 2 answers 8% fewer
+      photos than 3, in 52 ms instead of 71 (median)
   MaxWaiting:
     Type: Number
-    Default: 4
-    Description: Decoded requests that may wait for the GPU in one inference server
+    Default: 3
+    Description: Requests that may wait for the GPU in one inference server (one more than a batch)
   Workers:
     Type: Number
     Default: 1
-    Description: Batches one inference server runs on its GPU at the same time (at most the lanes its engines were built with)
-  EdgeTasks:
-    Type: Number
-    Default: 8
-    Description: Edge proxies (Fargate tasks). They do not run on the GPU hosts, so a host failure does not take them down
-  EdgeRate:
-    Type: Number
-    Default: 110
-    Description: Requests per second one edge proxy lets through to the fleet. Above this it answers 503 at once
+    Description: >-
+      Batches one inference server runs on its GPU at the same time. More than one did not serve
+      more photos on an L4 (the GPU is already at its power limit) and made every answer slower
   MaxArrivalRate:
     Type: Number
-    Default: 150
-    Description: Requests per second a GPU task's own proxy lets through to its inference server (second limit, behind EdgeRate)
+    Default: 100
+    Description: Requests per second the proxy lets through to one inference server. Above this it answers 503 at once
   MaxInSystem:
     Type: Number
     Default: 32
     Description: Requests inside one inference server at most (safety limit, not reached in normal operation)
 
 Resources:
-  # ---------------- Security groups: client -> ALB -> edge proxies -> fleet ALB -> GPU tasks ----------------
+  # ---------------- Security groups: client -> ALB -> proxy port; hosts reach AWS endpoints only ----------------
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-alb"
+      GroupDescription: entry point - internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ClientSecurityGroupId}
   ServiceSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -80,59 +87,22 @@ Resources:
       SecurityGroupEgress:
         - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSecurityGroupId}
         - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId}
-  EdgeSg:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub "exam-r${RunId}-edge"
-      GroupDescription: edge proxies - AWS endpoints and S3 (image pull, logs), and the fleet ALB
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSecurityGroupId}
-        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId}
-  FleetAlbSg:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub "exam-r${RunId}-fleet-alb"
-      GroupDescription: fleet ALB - from the edge proxies to the GPU tasks
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref EdgeSg}
-      SecurityGroupEgress:
-        - {IpProtocol: tcp, FromPort: 8081, ToPort: 8081, DestinationSecurityGroupId: !Ref ServiceSg}
-  AlbSg:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub "exam-r${RunId}-alb"
-      GroupDescription: entry point - internal ALB, from the clients to the edge proxies
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ClientSecurityGroupId}
-      SecurityGroupEgress:
-        - {IpProtocol: tcp, FromPort: 8082, ToPort: 8082, DestinationSecurityGroupId: !Ref EdgeSg}
-  EdgeFromAlb:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EdgeSg
-      IpProtocol: tcp
-      FromPort: 8082
-      ToPort: 8082
-      SourceSecurityGroupId: !Ref AlbSg
-  EdgeToFleetAlb:
+  AlbToService:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
-      GroupId: !Ref EdgeSg
+      GroupId: !Ref AlbSg
       IpProtocol: tcp
-      FromPort: 80
-      ToPort: 80
-      DestinationSecurityGroupId: !Ref FleetAlbSg
-  ServiceFromFleetAlb:
+      FromPort: 8081
+      ToPort: 8081
+      DestinationSecurityGroupId: !Ref ServiceSg
+  ServiceFromAlb:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref ServiceSg
       IpProtocol: tcp
       FromPort: 8081
       ToPort: 8081
-      SourceSecurityGroupId: !Ref FleetAlbSg
+      SourceSecurityGroupId: !Ref AlbSg
 
   # ---------------- GPU hosts ----------------
   Cluster:
@@ -235,6 +205,16 @@ Resources:
             # away the requests a batch leaves behind instead of answering them late.
             - {Name: MAX_WAITING, Value: !Ref MaxWaiting}
             - {Name: WORKERS, Value: !Ref Workers}
+            # The numeric libraries start one thread per CPU and let idle threads spin. That kept
+            # all four CPUs busy for nothing (396% measured, 126% with these settings) and cost
+            # 8% of the photos served. One thread each, and no spinning.
+            - {Name: OMP_NUM_THREADS, Value: "1"}
+            - {Name: MKL_NUM_THREADS, Value: "1"}
+            - {Name: OPENBLAS_NUM_THREADS, Value: "1"}
+            - {Name: NUMEXPR_NUM_THREADS, Value: "1"}
+            - {Name: KMP_BLOCKTIME, Value: "0"}
+            - {Name: OMP_WAIT_POLICY, Value: passive}
+            - {Name: OPENCV_FOR_THREADS_NUM, Value: "1"}
             - {Name: METRIC_NAMESPACE, Value: !Sub "exam-r${RunId}-fleet"}
           User: "10001"
           ReadonlyRootFilesystem: true
@@ -322,15 +302,14 @@ Resources:
               awslogs-stream-prefix: proxy
               mode: non-blocking
               max-buffer-size: 4m
-  # ---------------- Fleet ALB: in front of the GPU tasks, called by the edge proxies only ----------------
-  FleetAlb:
+  Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "exam-r${RunId}-fleet"
+      Name: !Sub "exam-r${RunId}-alb"
       Scheme: internal
       Type: application
       Subnets: !Ref SubnetIds
-      SecurityGroups: [!Ref FleetAlbSg]
+      SecurityGroups: [!Ref AlbSg]
   Targets:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -347,17 +326,17 @@ Resources:
       TargetGroupAttributes:
         - {Key: deregistration_delay.timeout_seconds, Value: "15"}
         - {Key: load_balancing.algorithm.type, Value: least_outstanding_requests}
-  FleetListener:
+  Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
-      LoadBalancerArn: !Ref FleetAlb
+      LoadBalancerArn: !Ref Alb
       Port: 80
       Protocol: HTTP
       DefaultActions:
         - {Type: forward, TargetGroupArn: !Ref Targets}
   Service:
     Type: AWS::ECS::Service
-    DependsOn: [FleetListener, HostGroup]
+    DependsOn: [Listener, HostGroup]
     Properties:
       ServiceName: !Sub "exam-r${RunId}-inference"
       Cluster: !Ref Cluster
@@ -381,145 +360,6 @@ Resources:
       LoadBalancers:
         - {ContainerName: proxy, ContainerPort: 8081, TargetGroupArn: !Ref Targets}
 
-  # ---------------- Entry point and edge proxies ----------------
-  # A GPU host that disappears takes with it the requests it was processing, and the fleet ALB
-  # keeps routing to it for the two health check intervals it needs to notice. A load balancer
-  # does not send a request a second time; this tier does. It runs on Fargate, not on the GPU
-  # hosts, so the failure it covers cannot take it down as well.
-  Alb:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: !Sub "exam-r${RunId}-alb"
-      Scheme: internal
-      Type: application
-      Subnets: !Ref SubnetIds
-      SecurityGroups: [!Ref AlbSg]
-  EdgeTargets:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: !Sub "exam-r${RunId}-edge"
-      TargetType: ip
-      Protocol: HTTP
-      Port: 8082
-      VpcId: !Ref VpcId
-      HealthCheckPath: /health
-      HealthCheckIntervalSeconds: 5
-      HealthCheckTimeoutSeconds: 3
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      TargetGroupAttributes:
-        - {Key: deregistration_delay.timeout_seconds, Value: "15"}
-        - {Key: load_balancing.algorithm.type, Value: least_outstanding_requests}
-  Listener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref Alb
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - {Type: forward, TargetGroupArn: !Ref EdgeTargets}
-  EdgeTask:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: !Sub "exam-r${RunId}-edge"
-      NetworkMode: awsvpc
-      RequiresCompatibilities: [FARGATE]
-      Cpu: "1024"
-      Memory: "2048"
-      ExecutionRoleArn: !Ref TaskExecutionRoleArn
-      ContainerDefinitions:
-        - Name: edge
-          Image: !Ref ImageHaproxy
-          Essential: true
-          User: "99"
-          ReadonlyRootFilesystem: true
-          Privileged: false
-          PortMappings: [{ContainerPort: 8082, Protocol: tcp}]
-          Ulimits: [{Name: nofile, SoftLimit: 65536, HardLimit: 65536}]
-          LinuxParameters:
-            InitProcessEnabled: true
-            Capabilities: {Drop: [ALL]}
-          EntryPoint: [sh, -c]
-          Command:
-            - printf '%s\n' "$HAPROXY_CFG" | haproxy -db -f /dev/stdin
-          Environment:
-            - Name: HAPROXY_CFG
-              # - A request is held until its photo has arrived (tune.bufsize covers a whole photo),
-              #   so that it can be sent again: on a failed connection, an empty answer, no answer
-              #   within timeout server, or a 502/504 from the fleet ALB. Each new attempt goes
-              #   through the fleet ALB again, which routes by outstanding requests and therefore
-              #   away from a host that has stopped answering. 503 is not retried: it is the
-              #   fleet saying it is full.
-              # - Above EdgeRate the proxy answers 503 on the headers alone, without reading the
-              #   photo. This is what keeps 6,000 uploads per second away from the fleet.
-              # - /health is answered by the proxy itself.
-              Value: !Sub |
-                global
-                    log stdout format raw local0 notice
-                    nbthread 1
-                    tune.bufsize 1048576
-
-                defaults
-                    mode http
-                    log global
-                    option dontlognull
-                    retries 5
-                    option redispatch
-                    retry-on conn-failure empty-response response-timeout 502 504
-                    timeout connect 1s
-                    timeout client 15s
-                    timeout server 1500ms
-                    timeout http-request 5s
-                    timeout http-keep-alive 75s
-
-                resolvers vpc
-                    parse-resolv-conf
-                    hold valid 10s
-                    resolve_retries 3
-                    timeout resolve 1s
-                    timeout retry 1s
-
-                frontend entry
-                    bind :8082
-                    acl is_health path /health
-                    acl flooding be_sess_rate(fleet) ge ${EdgeRate}
-                    http-request return status 200 content-type text/plain string ok if is_health
-                    http-request deny deny_status 503 if flooding
-                    default_backend fleet
-
-                backend fleet
-                    http-request wait-for-body time 5s
-                    server-template alb 6 ${FleetAlb.DNSName}:80 resolvers vpc init-addr libc,none resolve-prefer ipv4
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref Logs
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: edge
-              mode: non-blocking
-              max-buffer-size: 4m
-  EdgeService:
-    Type: AWS::ECS::Service
-    DependsOn: Listener
-    Properties:
-      ServiceName: !Sub "exam-r${RunId}-edge"
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref EdgeTask
-      LaunchType: FARGATE
-      DesiredCount: !Ref EdgeTasks
-      HealthCheckGracePeriodSeconds: 60
-      DeploymentConfiguration:
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
-        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          Subnets: !Ref SubnetIds
-          SecurityGroups: [!Ref EdgeSg]
-          AssignPublicIp: DISABLED
-      LoadBalancers:
-        - {ContainerName: edge, ContainerPort: 8082, TargetGroupArn: !Ref EdgeTargets}
-
   # ---------------- Observability ----------------
   UnhealthyAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -529,7 +369,7 @@ Resources:
       Namespace: AWS/ApplicationELB
       MetricName: UnHealthyHostCount
       Dimensions:
-        - {Name: LoadBalancer, Value: !GetAtt FleetAlb.LoadBalancerFullName}
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
         - {Name: TargetGroup, Value: !GetAtt Targets.TargetGroupFullName}
       Statistic: Maximum
       Period: 60
@@ -608,7 +448,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "exam-r${RunId}-load-shedding"
-      AlarmDescription: Requests are being refused (by the edge proxies or the tasks) - demand exceeds fleet capacity
+      AlarmDescription: Tasks are rejecting requests - demand exceeds fleet capacity
       Namespace: AWS/ApplicationELB
       MetricName: HTTPCode_Target_5XX_Count
       Dimensions:
@@ -650,7 +490,7 @@ Resources:
                         ["...", {"stat": "p95"}], ["...", {"stat": "p99"}]]}},
           {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts in service / healthy tasks", "stat": "Minimum", "period": 60,
             "metrics": [["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${HostGroup}"],
-                        ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${FleetAlb.LoadBalancerFullName}"]]}},
+                        ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
           {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Fleet signals from the tasks (share of tasks reporting)", "stat": "Average", "period": 10,
             "metrics": [["exam-r${RunId}-fleet", "FleetSaturated"], ["exam-r${RunId}-fleet", "FleetIdle"]]}}
         ]}

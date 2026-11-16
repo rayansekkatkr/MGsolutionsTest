@@ -44,8 +44,7 @@ def main():
 
     listed = aws(args.region, "cloudwatch", "list-metrics", "--namespace", "AWS/ApplicationELB", "--metric-name", "RequestCount")
     balancers = sorted({d["Value"] for m in listed.get("Metrics", []) for d in m["Dimensions"]
-                        if d["Name"] == "LoadBalancer" and d["Value"].startswith((f"app/exam-r{args.run_id}-alb/",
-                                                                                  f"app/exam-r{args.run_id}-fleet/"))})
+                        if d["Name"] == "LoadBalancer" and d["Value"].startswith(f"app/exam-r{args.run_id}-alb/")})
     for balancer in balancers:
         queries = [{"Id": f"m{i}", "ReturnData": True,
                     "MetricStat": {"Metric": {"Namespace": "AWS/ApplicationELB", "MetricName": metric,
@@ -74,23 +73,6 @@ def main():
                 else:
                     cells.append(f"{value:.0f}")
             print("   " + minute.ljust(6) + "".join(cell.rjust(13) for cell in cells))
-
-    print("== edge proxies (Fargate service), per minute (UTC): CPU and memory, average and highest task, % of the task size")
-    dimensions = [{"Name": "ClusterName", "Value": f"exam-r{args.run_id}-cluster"}, {"Name": "ServiceName", "Value": f"exam-r{args.run_id}-edge"}]
-    queries = [{"Id": f"e{i}", "ReturnData": True,
-                "MetricStat": {"Metric": {"Namespace": "AWS/ECS", "MetricName": metric, "Dimensions": dimensions}, "Period": 60, "Stat": stat}}
-               for i, (metric, stat) in enumerate([("CPUUtilization", "Average"), ("CPUUtilization", "Maximum"),
-                                                   ("MemoryUtilization", "Average"), ("MemoryUtilization", "Maximum")])]
-    data = aws(args.region, "cloudwatch", "get-metric-data", "--start-time", args.start, "--end-time", args.end,
-               "--metric-data-queries", json.dumps(queries))
-    table = {}
-    for result in data.get("MetricDataResults", []):
-        for stamp, value in zip(result["Timestamps"], result["Values"]):
-            table.setdefault(stamp[11:16], {})[result["Id"]] = value
-    print("   time   cpu avg  cpu max  mem avg  mem max")
-    for minute in sorted(table):
-        row = table[minute]
-        print(f"   {minute}  " + "  ".join(f"{row[key]:>7.1f}" if key in row else "      -" for key in ("e0", "e1", "e2", "e3")))
 
     print("== fleet alarms: state changes and actions")
     for alarm in ("fleet-saturated", "fleet-idle", "fleet-idle-from-logs"):

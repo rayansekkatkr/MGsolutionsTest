@@ -1,11 +1,8 @@
-"""Extract what ECS will run for the two proxy containers, straight from exam/template.yaml.
+"""Extract what ECS will run for the proxy container, straight from exam/template.yaml.
 
 Usage: python render.py TEMPLATE IMAGES_JSON OUT_DIR
-Writes, with parameter defaults substituted, haproxy.cfg, command.txt and user.txt for the proxy
-of a GPU task, edge.cfg, edge_command.txt and edge_user.txt for an edge proxy, and image.txt,
-max_batch.txt, max_waiting.txt, workers.txt, so the test exercises the template itself and not a copy of its
-configuration. The one thing replaced is the fleet ALB's DNS name in the edge configuration,
-which becomes FLEET_ALB (to be set to the address of the stand-in used in the test).
+Writes haproxy.cfg (with parameter defaults substituted), command.txt, user.txt, image.txt and max_batch.txt,
+so the test exercises the template itself and not a copy of its configuration.
 """
 import json
 import pathlib
@@ -52,22 +49,4 @@ out.mkdir(parents=True, exist_ok=True)
 (out / "max_batch.txt").write_text(str(defaults["MaxBatch"]))
 (out / "max_waiting.txt").write_text(str(defaults["MaxWaiting"]))
 (out / "workers.txt").write_text(str(defaults["Workers"]))
-
-edge = doc["Resources"]["EdgeTask"]["Properties"]["ContainerDefinitions"][0]
-edge_config = next(e for e in edge["Environment"] if e["Name"] == "HAPROXY_CFG")["Value"]["Sub"]
-for name, value in defaults.items():
-    if value is not None:
-        edge_config = edge_config.replace("${%s}" % name, str(value))
-# In the test the fleet ALB is a stand-in at a fixed address: no DNS name to follow.
-lines = edge_config.splitlines()
-fleet = [i for i, line in enumerate(lines) if "${FleetAlb.DNSName}" in line]
-assert len(fleet) == 1 and lines[fleet[0]].strip().startswith("server-template alb")
-lines[fleet[0]] = "    server alb FLEET_ALB"
-edge_config = "\n".join(lines) + "\n"
-assert "${" not in edge_config, "unresolved substitution in the edge configuration"
-assert edge["EntryPoint"] == ["sh", "-c"] and len(edge["Command"]) == 1 and edge["Image"]["Ref"] == image_param
-(out / "edge.cfg").write_text(edge_config)
-(out / "edge_command.txt").write_text(edge["Command"][0])
-(out / "edge_user.txt").write_text(str(edge["User"]))
-print(f"image={image} task proxy: user={proxy['User']} arrival_rate={defaults['MaxArrivalRate']}/s in_system={defaults['MaxInSystem']}"
-      f" | edge proxy: user={edge['User']} rate={defaults['EdgeRate']}/s")
+print(f"image={image} user={proxy['User']} arrival_rate={defaults['MaxArrivalRate']}/s in_system={defaults['MaxInSystem']}")

@@ -20,8 +20,6 @@ if (( HOSTS < 2 )); then
 fi
 # Two zones that offer the instance type. An offering is not a guarantee of capacity at a given
 # moment: STAGING_ZONES="us-east-1c us-east-1d" chooses other zones when a launch fails for lack of it.
-FARGATE="$(aws service-quotas get-service-quota --service-code fargate --quota-code L-3032A538 --query 'Quota.Value' --output text 2>/dev/null || echo unknown)"
-echo "== Fargate vCPU quota: $FARGATE (needed: $HOSTS for the edge proxies + 4 for the load client)"
 ZONES="${STAGING_ZONES:-$(aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=g6.xlarge \
   --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -2 | tr '\n' ' ')}"
 set -- $ZONES
@@ -98,7 +96,6 @@ params = {
     "ImageInference": "$INFERENCE_IMAGE",
     "ImageHaproxy": "$HAPROXY_IMAGE",
     "Hosts": "$HOSTS",
-    "EdgeTasks": "$HOSTS",
 }
 json.dump([{"ParameterKey": k, "ParameterValue": v} for k, v in params.items()], open(sys.argv[1], "w"), indent=1)
 PY
