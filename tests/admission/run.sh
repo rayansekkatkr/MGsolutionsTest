@@ -63,7 +63,7 @@ echo "--- 4. one host's share of stages 4 and 5: answers at capacity, and fast"
 WORKERS="$(cat "$OUT/workers.txt")"
 if [ "$WORKERS" -gt 1 ]; then CAPACITY=65; else CAPACITY=42; fi
 $LOAD http://127.0.0.1:8081 --rate 208 --seconds 20 --min-correct-per-s "$CAPACITY" --max-p99-ms 200
-$LOAD http://127.0.0.1:8081 --rate 750 --seconds 20 --procs 2 --min-correct-per-s 55 --max-p99-ms 200
+$LOAD http://127.0.0.1:8081 --rate 750 --seconds 20 --procs 2 --min-correct-per-s "$CAPACITY" --max-p99-ms 200
 
 echo "--- 5. back to a light load right after the overload: every request answered again"
 $LOAD http://127.0.0.1:8081 --rate 2.1 --seconds 10 --min-correct-share 1 --max-p99-ms 200
