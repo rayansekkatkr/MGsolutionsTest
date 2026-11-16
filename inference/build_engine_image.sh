@@ -9,20 +9,20 @@
 #      the 1,000 practice photos against the reference results, then load
 #   5. push, only if the share of answers within tolerance is high enough
 #
-# Usage: bash inference/build_engine_image.sh DET_VARIANT POSE_VARIANT   (names from trt_build.py)
+# Usage: bash inference/build_engine_image.sh DET_VARIANT POSE_VARIANT [MIN_CORRECT_SHARE]   (names from trt_build.py)
 #        REBUILD=1 forces new engines; otherwise engines already built on this machine are reused,
 #        so that the engines published are the ones that were measured.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DET="${1:?detector variant}"; POSE="${2:?pose variant}"
-MIN_CORRECT="${MIN_CORRECT:-0.985}"
+MIN_CORRECT="${3:-0.985}"
 WORK="$HOME/exam-gpu"   # outside the checkout, which is wiped at the start of every run
 REF="$WORK/practice_reference.jsonl"
 BASE=pose-inference:base
 FINAL=pose-inference:engines
 REMOTE="ghcr.io/${GITHUB_REPOSITORY_OWNER:-rayansekkatkr}/mgsolutionstest-inference"
 REMOTE="$(echo "$REMOTE" | tr '[:upper:]' '[:lower:]')"
-TAG="$(git rev-parse --short=12 HEAD)-l4"
+TAG="$(git rev-parse --short=12 HEAD)-l4-${DET#det_}"
 
 echo "--- 1. base image"
 docker build -q -t "$BASE" inference >/dev/null

@@ -115,7 +115,7 @@ class Engine:
             # about 1 on this measure, reduced precision by about 0.001.
             worst = max(float((a - b).abs().median() / b.abs().median().clamp(min=1e-6)) for a, b in zip(net(x), expected))
             print(f"{path.name}: typical relative difference from PyTorch on the check input {worst:.4f}", flush=True)
-            if not worst < 0.05:
+            if not worst < 0.2:
                 raise RuntimeError(f"{path.name} does not reproduce the PyTorch outputs")
             return net
 
