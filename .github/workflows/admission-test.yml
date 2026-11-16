@@ -1,0 +1,23 @@
+name: admission-test
+
+on:
+  push:
+    branches: [main, round3-inference-image]
+    paths: ["exam/**", "inference/server.py", "inference/admission.py", "tests/admission/**", "bench/load_open.py", ".github/workflows/admission-test.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install pyyaml aiohttp==3.9.5 "numpy<2" "opencv-python-headless<4.11"
+      - name: Proxy as the task definition describes it, in front of the real server with a stand-in engine
+        run: bash tests/admission/run.sh

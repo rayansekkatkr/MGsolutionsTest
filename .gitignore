@@ -1,4 +1,5 @@
-tests/proxy/out/
+__pycache__/
 tests/inference/out/
 tests/inference/out-gpu/
 staging/out/
+tests/admission/out/

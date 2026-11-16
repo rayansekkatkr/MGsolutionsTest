@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  v2 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Each task runs an HAProxy admission
-  controller in front of the reference inference container: a bounded number of requests reach
-  the model, the excess is rejected immediately. The fleet is provisioned at full size from
-  creation because a GPU host needs longer to become useful than the load profile allows.
+  v3 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Each task runs a batching inference
+  server (same models and weights as the reference, fp16 backbones, several photos per forward
+  pass) behind an HAProxy sidecar that caps what reaches it. Under overload the server answers the
+  freshest requests and turns the rest away at once. The fleet starts at full size; after a peak,
+  when the tasks report that demand is back to a small fraction of capacity, it shrinks to IdleHosts.
 
 Parameters:
   VpcId: {Type: "AWS::EC2::VPC::Id"}
@@ -13,24 +14,35 @@ Parameters:
   S3PrefixListId: {Type: String}
   RunId: {Type: String}
   TaskExecutionRoleArn: {Type: String}
+  AppRoleArn: {Type: String}
   InstanceProfileArn: {Type: String}
-  ReferenceImageUri: {Type: String}
   EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
+  ImageInference:
+    Type: String
+    Description: Inference server image (exam/images.json), built from inference/ in the repository
   ImageHaproxy:
     Type: String
     Description: Official HAProxy image (exam/images.json), used unmodified
   Hosts:
     Type: Number
     Default: 8
-    Description: GPU hosts, fixed for the whole run (exam cap is 8). One task per host
-  MaxInFlight:
+    Description: GPU hosts at creation and under load (exam cap is 8). One task per host
+  IdleHosts:
     Type: Number
-    Default: 2
-    Description: Requests a model container processes at the same time
+    Default: 1
+    Description: GPU hosts kept once a peak is over and demand is a small fraction of capacity
+  MaxBatch:
+    Type: Number
+    Default: 3
+    Description: Photos per forward pass at most
+  MaxArrivalRate:
+    Type: Number
+    Default: 100
+    Description: Requests per second the proxy lets through to one inference server. Above this it answers 503 at once
   MaxInSystem:
     Type: Number
-    Default: 4
-    Description: Requests admitted per task (in flight + waiting). Above this the proxy answers 503 at once
+    Default: 32
+    Description: Requests inside one inference server at most (safety limit, not reached in normal operation)
 
 Resources:
   # ---------------- Security groups: client -> ALB -> proxy port; hosts reach AWS endpoints only ----------------
@@ -46,10 +58,10 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub "exam-r${RunId}-service"
-      GroupDescription: inference tasks - no outbound
+      GroupDescription: inference tasks - outbound to the AWS endpoints only (CloudWatch metrics)
       VpcId: !Ref VpcId
       SecurityGroupEgress:
-        - {IpProtocol: "-1", CidrIp: 127.0.0.1/32}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSecurityGroupId}
   HostSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -109,9 +121,10 @@ Resources:
             EOF
   HostGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Cluster
     Properties:
       AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
-      MinSize: !Ref Hosts
+      MinSize: !Ref IdleHosts
       MaxSize: !Ref Hosts
       DesiredCapacity: !Ref Hosts
       HealthCheckType: EC2
@@ -124,7 +137,29 @@ Resources:
         LaunchTemplateId: !Ref HostTemplate
         Version: !GetAtt HostTemplate.LatestVersionNumber
 
-  # ---------------- Inference task: admission proxy + reference model container ----------------
+  # Fleet size. A GPU host needs about five minutes to become useful, longer than a load stage
+  # leaves, so the group starts at Hosts and is not grown reactively. It is shrunk to IdleHosts when
+  # the tasks report that a peak is over (FleetIdle), and brought back to Hosts when they report
+  # that they turn requests away (FleetSaturated). Both signals come from inference/admission.py.
+  ShrinkPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      StepAdjustments:
+        - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref IdleHosts}
+  GrowPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      EstimatedInstanceWarmup: 300
+      StepAdjustments:
+        - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref Hosts}
+
+  # ---------------- Inference task: batching inference server + admission proxy ----------------
   Logs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -136,14 +171,20 @@ Resources:
       Family: !Sub "exam-r${RunId}-inference"
       NetworkMode: awsvpc
       RequiresCompatibilities: [EC2]
-      Cpu: "3072"
       Memory: "12288"
       ExecutionRoleArn: !Ref TaskExecutionRoleArn
+      TaskRoleArn: !Ref AppRoleArn
       ContainerDefinitions:
-        # Reference image, unchanged. Reached only through the proxy on localhost.
+        # Batching inference server. Reached only through the proxy on localhost. Cpu values are
+        # shares, not a ceiling: the task may use the whole host, which runs nothing else.
         - Name: inference
-          Image: !Ref ReferenceImageUri
+          Image: !Ref ImageInference
           Essential: true
+          Cpu: 3584
+          Environment:
+            - {Name: PRECISION, Value: fp16}
+            - {Name: MAX_BATCH, Value: !Ref MaxBatch}
+            - {Name: METRIC_NAMESPACE, Value: !Sub "exam-r${RunId}-fleet"}
           User: "10001"
           ReadonlyRootFilesystem: true
           Privileged: false
@@ -167,13 +208,14 @@ Resources:
               awslogs-stream-prefix: inference
               mode: non-blocking
               max-buffer-size: 4m
-        # Admission control. The reference server starts one thread per request with no limit and
-        # keeps computing answers for clients that already timed out. The proxy lets MaxInFlight
-        # requests reach it, holds a short queue, and answers 503 immediately beyond MaxInSystem,
-        # so the GPU only works on requests that can still be answered in time.
+        # Admission proxy. At 6,000 requests/s the fleet receives about twenty times what it can
+        # compute. The proxy answers 503 to the bulk of the excess without involving the inference
+        # process, and lets through a steady MaxArrivalRate so that the server always has fresh
+        # requests to choose from. MaxInSystem is a safety limit should the server stall.
         - Name: proxy
           Image: !Ref ImageHaproxy
           Essential: true
+          Cpu: 512
           User: "99"
           ReadonlyRootFilesystem: true
           Privileged: false
@@ -209,13 +251,15 @@ Resources:
                 frontend entry
                     bind :8081
                     acl is_health path /health
-                    acl saturated be_conn(infer) ge ${MaxInSystem}
-                    http-request deny deny_status 503 if !is_health saturated
+                    acl flooding be_sess_rate(infer) ge ${MaxArrivalRate}
+                    acl stalled be_conn(infer) ge ${MaxInSystem}
+                    http-request deny deny_status 503 if !is_health flooding
+                    http-request deny deny_status 503 if !is_health stalled
                     use_backend health if is_health
                     default_backend infer
 
                 backend infer
-                    server model 127.0.0.1:8080 maxconn ${MaxInFlight}
+                    server model 127.0.0.1:8080 maxconn ${MaxInSystem}
 
                 backend health
                     server model 127.0.0.1:8080
@@ -302,11 +346,63 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+  # Fleet signals published by the tasks (namespace exam-r<RunId>-fleet, one value per task every
+  # 5 s). Average > 0.5 means most tasks agree. The idle signal has a second path that needs no
+  # CloudWatch API call from the task: the same condition is written to the log and counted here.
+  FleetIdleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-fleet-idle"
+      AlarmDescription: The peak is over and demand is a small fraction of capacity - shrink the fleet to IdleHosts
+      Namespace: !Sub "exam-r${RunId}-fleet"
+      MetricName: FleetIdle
+      Statistic: Average
+      Period: 10
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ShrinkPolicy]
+  FleetIdleLines:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref Logs
+      FilterPattern: '"fleet-idle"'
+      MetricTransformations:
+        - {MetricNamespace: !Sub "exam-r${RunId}-fleet", MetricName: FleetIdleLines, MetricValue: "1"}
+  FleetIdleLogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-fleet-idle-from-logs"
+      AlarmDescription: Same condition as fleet-idle, counted from the tasks' log lines (a task writes one every 5 s while idle)
+      Namespace: !Sub "exam-r${RunId}-fleet"
+      MetricName: FleetIdleLines
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 24
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ShrinkPolicy]
+  FleetSaturatedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-fleet-saturated"
+      AlarmDescription: Most tasks turn requests away - demand exceeds capacity, bring the fleet back to Hosts
+      Namespace: !Sub "exam-r${RunId}-fleet"
+      MetricName: FleetSaturated
+      Statistic: Average
+      Period: 10
+      EvaluationPeriods: 3
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref GrowPolicy]
   HostsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "exam-r${RunId}-hosts-below-target"
-      AlarmDescription: Fewer GPU hosts in service than provisioned
+      AlarmDescription: Fewer GPU hosts in service than at full size (expected while the fleet is shrunk after a peak)
       Namespace: AWS/AutoScaling
       MetricName: GroupInServiceInstances
       Dimensions:
@@ -363,7 +459,9 @@ Resources:
                         ["...", {"stat": "p95"}], ["...", {"stat": "p99"}]]}},
           {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts in service / healthy tasks", "stat": "Minimum", "period": 60,
             "metrics": [["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${HostGroup}"],
-                        ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}}
+                        ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Fleet signals from the tasks (share of tasks reporting)", "stat": "Average", "period": 10,
+            "metrics": [["exam-r${RunId}-fleet", "FleetSaturated"], ["exam-r${RunId}-fleet", "FleetIdle"]]}}
         ]}
 
 Outputs:

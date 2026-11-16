@@ -1,62 +1,56 @@
 #!/usr/bin/env bash
 # The experiment currently being run on the GPU runner. Edited for each measurement.
-# This one, on the task's 1,000 practice photos:
-#   1. reference results (official APIs, fp32, one photo at a time) and a per-photo summary of them
-#   2. engine throughput and accuracy at fp16 for small batches
-#   3. HTTP server: throughput and latency for each (max batch, requests in the system) pair
+# This one: the task as it will run (inference server at fp16 behind the proxy configured by
+# exam/template.yaml) under open-loop load with the 1,000 practice photos, every answer checked
+# against the reference results. The load generator shares the host's 4 vCPUs with the server,
+# so the figures are on the low side.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 IMAGE=pose-inference:gpu
-# Kept outside the checkout: actions/checkout wipes untracked files at the start of every run.
-WORK="$HOME/exam-gpu"
-mkdir -p "$WORK/practice"
-xargs -P 8 -I{} sh -c '[ -s "$1/$(basename "$2")" ] || curl -fsS --retry 3 -o "$1/$(basename "$2")" "$2"' _ "$WORK/practice" {} \
-  < tests/inference/images_practice.txt
-echo "$(find "$WORK/practice" -name '*.jpg' | wc -l) practice photos"
-docker build -q -t "$IMAGE" inference >/dev/null
-trap 'docker rm -f server >/dev/null 2>&1 || true' EXIT
-RUN=(docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$WORK:/work" -v "$PWD/tests/inference:/tests:ro"
-     -v "$PWD/bench:/bench:ro" -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$IMAGE")
-
-echo "--- 1. reference on the practice photos"
+WORK="$HOME/exam-gpu"   # outside the checkout, which is wiped at the start of every run
 REF="$WORK/practice_reference.jsonl"
-[ "$(wc -l < "$REF" 2>/dev/null || echo 0)" = 1000 ] || "${RUN[@]}" python /tests/reference_run.py --images /work/practice --out /work/practice_reference.jsonl | tail -1
-echo "SUMMARY BEGIN"
-python3 - "$REF" <<'PY'
-import json, sys
-for row in map(json.loads, open(sys.argv[1])):
-    k2, k3 = row["keypoints_2d"], row["keypoints_3d"]
-    mean = lambda points, axis: sum(p[axis] for p in points) / len(points)
-    print(row["file"], *(f"{mean(k2, a):.3f}" for a in range(2)), *(f"{mean(k3, a):.5f}" for a in range(3)))
-PY
-echo "SUMMARY END"
+[ "$(wc -l < "$REF")" = 1000 ] && [ "$(find "$WORK/practice" -name '*.jpg' | wc -l)" = 1000 ]
+docker build -q -t "$IMAGE" inference >/dev/null
+trap 'docker rm -f server proxy >/dev/null 2>&1 || true' EXIT
 
-echo "--- 2. engine at fp16, small batches"
-rm -rf "$WORK/practice_out" && mkdir -p "$WORK/practice_out"
-"${RUN[@]}" python /bench/gpu_bench.py --images /work/practice --out /work/practice_out --batches 1,2,3,4 --precisions fp16 2>&1 \
-  | grep -v -i "warn\|meshgrid\|Loads checkpoint"
-for f in "$WORK"/practice_out/*.jsonl; do
-  echo "[$(basename "$f" .jsonl)]"
-  python3 tests/inference/compare.py "$REF" "$f" --min-pass 0 --list-failures | sed 's/^/  /'
-done
+mkdir -p "$WORK/render"
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$WORK/render:/out" "$IMAGE" \
+  python /repo/tests/admission/render.py /repo/exam/template.yaml /repo/exam/images.json /out
+docker rm -f proxy >/dev/null 2>&1 || true
+docker run -d --name proxy --network host --init --read-only --user "$(cat "$WORK/render/user.txt")" --cap-drop ALL \
+  --tmpfs /tmp:rw,nosuid,nodev,size=16m --ulimit nofile=65536:65536 -e HAPROXY_CFG="$(cat "$WORK/render/haproxy.cfg")" \
+  --entrypoint sh "$(cat "$WORK/render/image.txt")" -c "$(cat "$WORK/render/command.txt")" >/dev/null
 
-echo "--- 3. HTTP server at fp16: max batch x requests in the system"
-serve() {  # serve MAX_BATCH WORKERS
+serve() {  # serve MAX_BATCH
   docker rm -f server >/dev/null 2>&1 || true
   docker run -d --name server --gpus all --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
-    --shm-size 1024m -p 8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$1" -e WORKERS="$2" -e MAX_PENDING=256 "$IMAGE" >/dev/null
-  for i in $(seq 1 60); do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || true)" = 200 ] && break
+    --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$1" "$IMAGE" >/dev/null
+  for i in $(seq 1 90); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health || true)" = 200 ] && break
     sleep 2
   done
+  echo "[max batch $1] healthy through the proxy after about $((i * 2)) s"
 }
-load() {  # load IN_SYSTEM
-  python3 bench/load_closed.py --images "$WORK/practice" --url http://127.0.0.1:8080 --workers "$1" --seconds 15
-}
-for config in "1 1:1 2 3" "2 1:2 3 4" "3 1:3 4 6" "4 1:4 5 6 8" "1 2:2 3 4" "2 2:4 6"; do
-  settings="${config%%:*}"; set -- $settings
-  serve "$1" "$2"
-  echo "[max batch $1, batch threads $2]"
-  for n in ${config##*:}; do load "$n"; done
+load() { python3 bench/load_open.py --images "$WORK/practice" --reference "$REF" --url http://127.0.0.1:8081 "$@" || true; }
+
+echo "--- 1. template defaults: accuracy through the whole path, then each stage's share for one host"
+serve "$(cat "$WORK/render/max_batch.txt")"
+load --rate 12 --seconds 84 --max-wrong-share 0.02
+load --rate 2.1 --seconds 20
+load --rate 21 --seconds 30
+load --rate 208 --seconds 40 &
+sleep 25
+echo "  mid-run: GPU $(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader), host CPU idle $(top -bn1 | awk '/Cpu\(s\)/ {print $8}')%"
+wait
+load --rate 750 --seconds 40
+echo "  quiet for 25 s, then the fleet signal:"
+sleep 25
+docker logs server 2>&1 | grep -E "ready|fleet|last 30 s" | tail -12
+
+echo "--- 2. other batch sizes at one host's share of stage 4"
+for batch in 2 4; do
+  serve "$batch"
+  load --rate 21 --seconds 20
+  load --rate 208 --seconds 30
 done
 echo "JOB DONE"

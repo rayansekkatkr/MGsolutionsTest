@@ -1,1 +1,1 @@
-{"Haproxy": "docker.io/library/haproxy:3.0-alpine"}
+{"Inference": "ghcr.io/rayansekkatkr/mgsolutionstest-inference:pending", "Haproxy": "docker.io/library/haproxy:3.0-alpine"}

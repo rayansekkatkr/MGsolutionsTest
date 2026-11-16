@@ -3,15 +3,18 @@
 GET  /health  200 once the models are loaded and warmed up
 POST /infer   body = JPEG bytes, header X-Request-Id -> {"request_id", "keypoints_2d", "keypoints_3d"}
 
-Requests are grouped: while the GPU works on one batch, the next ones accumulate and leave together
-as soon as it is free. Under light load a request is processed alone, with at most BATCH_WAIT_MS of
-added delay. Admission control (how many requests may be in the system) is the proxy's job; the
-limit here is a second line of defence.
+Requests are decoded as they arrive and wait in a small pen. Each time the GPU is free the batch
+worker takes up to MAX_BATCH of them, newest first, and runs them through both models together.
+Under light load a request is processed alone and at once. When more arrives than the GPU can
+take, the requests that would wait longest are answered 503 immediately (see admission.Pen), so
+the answers that do go out stay fast. The proxy in front caps how many requests reach this process at all.
+
+Every few seconds the process also reports what it sees of the load (admission.FleetSignal) as
+CloudWatch metrics and as a log line; the scaling alarms of the fleet are driven by them.
 """
 import asyncio
 import json
 import os
-import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,26 +23,45 @@ import cv2
 import numpy as np
 from aiohttp import web
 
+from admission import FleetSignal, Pen
+
 PORT = int(os.environ.get("PORT", "8080"))
 PRECISION = os.environ.get("PRECISION", "fp32")
-MAX_BATCH = int(os.environ.get("MAX_BATCH", "8"))
-BATCH_WAIT_MS = float(os.environ.get("BATCH_WAIT_MS", "3"))
-MAX_PENDING = int(os.environ.get("MAX_PENDING", "64"))
-MAX_AGE_S = float(os.environ.get("MAX_AGE_S", "8"))  # the client gives up after 10 s
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "3"))
+MAX_WAITING = int(os.environ.get("MAX_WAITING", "8"))      # decoded requests waiting for the GPU
+MAX_AGE_S = float(os.environ.get("MAX_AGE_S", "2"))        # a request that waited longer is answered 503
+MAX_PENDING = int(os.environ.get("MAX_PENDING", "64"))     # requests inside this process, all states
 DECODE_THREADS = int(os.environ.get("DECODE_THREADS", "3"))
-WORKERS = int(os.environ.get("WORKERS", "1"))  # batch threads sharing the models
 OPTIONS = {name: os.environ.get(name.upper(), "0") == "1" for name in ("head_fp16", "channels_last", "cudnn_benchmark")}
+METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "")  # empty: no CloudWatch metrics
+IDLE_RATE = float(os.environ.get("IDLE_RATE", "3"))        # requests/s under which this task counts as idle
+SIGNAL_PERIOD_S = float(os.environ.get("SIGNAL_PERIOD_S", "5"))
 
 cv2.setNumThreads(1)  # decoding runs in its own pool; no nested threading
+
+
+class Busy(Exception):
+    pass
+
+
+class Job:
+    __slots__ = ("image", "future")
+
+    def __init__(self, image, future):
+        self.image, self.future = image, future
 
 
 class State:
     ready = False
     pending = 0
+    decoding = 0
     engine = None
     loop = None
-    jobs: "queue.Queue" = queue.Queue()
+    pen = Pen(MAX_WAITING, max_age_s=MAX_AGE_S)
+    signal = FleetSignal(idle_rate=IDLE_RATE)
     decoders = ThreadPoolExecutor(max_workers=DECODE_THREADS, thread_name_prefix="decode")
+    served = turned_away = batches = 0
+    batch_seconds = 0.0
 
 
 def decode(body: bytes):
@@ -57,58 +79,104 @@ def _resolve(future, result, error):
 
 
 def batch_worker():
-    """Takes whatever is waiting, up to MAX_BATCH, and runs it through both models."""
-    wait = BATCH_WAIT_MS / 1000
+    """Takes the newest waiting requests, up to MAX_BATCH, and runs them through both models."""
     while True:
-        batch = [State.jobs.get()]
-        deadline = time.monotonic() + wait
-        while len(batch) < MAX_BATCH:
-            try:
-                batch.append(State.jobs.get(timeout=max(0.0, deadline - time.monotonic())))
-            except queue.Empty:
-                break
-        now = time.monotonic()
-        fresh = []
-        for job in batch:
-            image, future, arrived = job
-            if future.cancelled() or now - arrived > MAX_AGE_S:
-                State.loop.call_soon_threadsafe(_resolve, future, None, TimeoutError("request expired in queue"))
-            else:
-                fresh.append(job)
-        if not fresh:
+        taken, turned_away = State.pen.take(MAX_BATCH)
+        for job in turned_away:
+            State.loop.call_soon_threadsafe(_resolve, job.future, None, Busy())
+        jobs = [job for job in taken if not job.future.cancelled()]  # the client may have gone away
+        if not jobs:
             continue
+        started = time.monotonic()
         try:
-            results = State.engine.infer([job[0] for job in fresh])
+            results = State.engine.infer([job.image for job in jobs])
         except Exception as error:  # one bad batch must not stop the worker
-            print(f"inference failed for a batch of {len(fresh)}: {error!r}", flush=True)
-            for _, future, _ in fresh:
-                State.loop.call_soon_threadsafe(_resolve, future, None, error)
+            print(f"inference failed for a batch of {len(jobs)}: {error!r}", flush=True)
+            for job in jobs:
+                State.loop.call_soon_threadsafe(_resolve, job.future, None, error)
             continue
-        for (_, future, _), result in zip(fresh, results):
-            State.loop.call_soon_threadsafe(_resolve, future, result, None)
+        State.batches += 1
+        State.batch_seconds += time.monotonic() - started
+        for job, result in zip(jobs, results):
+            State.loop.call_soon_threadsafe(_resolve, job.future, result, None)
+
+
+def signal_worker():
+    """Reports the fleet signals: CloudWatch metrics when a namespace is given, and log lines."""
+    client = None
+    if METRIC_NAMESPACE:
+        try:
+            import boto3
+            from botocore.config import Config
+            client = boto3.client("cloudwatch", config=Config(connect_timeout=2, read_timeout=2,
+                                                              retries={"total_max_attempts": 1}))
+        except Exception as error:
+            print(f"fleet metrics disabled: {error!r}", flush=True)
+    previous, failures, last_summary = None, 0, time.monotonic()
+    counted = (0, 0, 0, 0.0)
+    while True:
+        time.sleep(SIGNAL_PERIOD_S)
+        state = State.signal.state()
+        flags = (state["saturated"], state["idle"])
+        if flags != previous:
+            print(f"fleet signal: saturated={flags[0]} idle={flags[1]} armed={state['armed']} "
+                  f"arrivals={state['arrivals_per_s']:.1f}/s", flush=True)
+            previous = flags
+        if state["idle"]:
+            print("fleet-idle 1", flush=True)  # counted by a log metric filter: second path to the alarm
+        if client is not None:
+            try:
+                client.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=[
+                    {"MetricName": "FleetIdle", "Value": state["idle"], "StorageResolution": 1},
+                    {"MetricName": "FleetSaturated", "Value": state["saturated"], "StorageResolution": 1}])
+                failures = 0
+            except Exception as error:
+                failures += 1
+                if failures in (1, 12) or failures % 120 == 0:
+                    print(f"fleet metrics not delivered ({failures} in a row): {error!r}", flush=True)
+        if time.monotonic() - last_summary >= 30:
+            now = (State.served, State.turned_away, State.batches, State.batch_seconds)
+            served, turned_away, batches, seconds = (a - b for a, b in zip(now, counted))
+            if served or turned_away:
+                print(f"last 30 s: served {served}, turned away {turned_away}, "
+                      f"{served / max(batches, 1):.1f} photos per batch, {1000 * seconds / max(batches, 1):.0f} ms per batch",
+                      flush=True)
+            counted, last_summary = now, time.monotonic()
 
 
 def load_models():
-    from engine import Engine
-
     started = time.monotonic()
-    State.engine = Engine(precision=PRECISION, **OPTIONS)
-    # Warm up with the batch sizes used in service so the first real requests are not slower.
-    rng = np.random.default_rng(0)
-    image = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
-    for size in sorted({1, MAX_BATCH}):
-        State.engine.infer([image] * size)
-    for n in range(WORKERS):
-        threading.Thread(target=batch_worker, name=f"batch-{n}", daemon=True).start()
+    try:
+        from engine import Engine
+
+        State.engine = Engine(precision=PRECISION, **OPTIONS)
+        # Warm up with the batch sizes used in service so the first real requests are not slower.
+        rng = np.random.default_rng(0)
+        image = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
+        for size in range(1, MAX_BATCH + 1):
+            State.engine.infer([image] * size)
+    except Exception as error:
+        # A process that can never become ready must not stay up answering 503: exit, so that the
+        # container is restarted and the failure is visible.
+        print(f"could not load the models: {error!r}", flush=True)
+        os._exit(1)
+    threading.Thread(target=batch_worker, name="batch", daemon=True).start()
+    threading.Thread(target=signal_worker, name="signal", daemon=True).start()
     State.ready = True
     print(f"ready: device={State.engine.device} precision={'fp16' if State.engine.fp16 else 'fp32'} "
-          f"max_batch={MAX_BATCH} workers={WORKERS} options={[k for k, v in OPTIONS.items() if v]} "
+          f"max_batch={MAX_BATCH} max_waiting={MAX_WAITING} options={[k for k, v in OPTIONS.items() if v]} "
           f"in {time.monotonic() - started:.1f} s", flush=True)
 
 
 def reply(status: int, payload: dict) -> web.Response:
     return web.Response(status=status, body=json.dumps(payload, separators=(",", ":")).encode(),
                         content_type="application/json")
+
+
+def turn_away(request_id: str, reason: str) -> web.Response:
+    State.turned_away += 1
+    State.signal.turned_away()
+    return reply(503, {"request_id": request_id, "error": reason})
 
 
 async def health(request: web.Request) -> web.Response:
@@ -119,23 +187,30 @@ async def infer(request: web.Request) -> web.Response:
     request_id = request.headers.get("X-Request-Id", "")
     if not State.ready:
         return reply(503, {"request_id": request_id, "error": "loading"})
-    if State.pending >= MAX_PENDING:
-        return reply(503, {"request_id": request_id, "error": "busy"})
+    State.signal.arrival()
+    if State.pending >= MAX_PENDING or State.decoding >= 2 * DECODE_THREADS:
+        return turn_away(request_id, "busy")
     State.pending += 1
     try:
-        arrived = time.monotonic()
         body = await request.read()
-        image = await State.loop.run_in_executor(State.decoders, decode, body)
+        State.decoding += 1
+        try:
+            image = await State.loop.run_in_executor(State.decoders, decode, body)
+        finally:
+            State.decoding -= 1
         if image is None:
             return reply(400, {"request_id": request_id, "error": "body is not a decodable image"})
         future = State.loop.create_future()
-        State.jobs.put((image, future, arrived))
+        pushed_out = State.pen.put(Job(image, future))
+        if pushed_out is not None:
+            _resolve(pushed_out.future, None, Busy())
         try:
             keypoints_2d, keypoints_3d = await future
-        except TimeoutError:
-            return reply(503, {"request_id": request_id, "error": "expired"})
+        except Busy:
+            return turn_away(request_id, "busy")
         except Exception:
             return reply(500, {"request_id": request_id, "error": "inference failed"})
+        State.served += 1
         return reply(200, {"request_id": request_id,
                            "keypoints_2d": np.round(keypoints_2d, 2).tolist(),
                            "keypoints_3d": np.round(keypoints_3d, 5).tolist()})

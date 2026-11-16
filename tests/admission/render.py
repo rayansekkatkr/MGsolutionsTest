@@ -1,7 +1,7 @@
 """Extract what ECS will run for the proxy container, straight from exam/template.yaml.
 
 Usage: python render.py TEMPLATE IMAGES_JSON OUT_DIR
-Writes haproxy.cfg (with parameter defaults substituted), command.txt, user.txt and image.txt,
+Writes haproxy.cfg (with parameter defaults substituted), command.txt, user.txt, image.txt and max_batch.txt,
 so the test exercises the template itself and not a copy of its configuration.
 """
 import json
@@ -46,4 +46,5 @@ out.mkdir(parents=True, exist_ok=True)
 (out / "command.txt").write_text(proxy["Command"][0])
 (out / "user.txt").write_text(str(proxy["User"]))
 (out / "image.txt").write_text(image)
-print(f"image={image} user={proxy['User']} in_flight={defaults['MaxInFlight']} in_system={defaults['MaxInSystem']}")
+(out / "max_batch.txt").write_text(str(defaults["MaxBatch"]))
+print(f"image={image} user={proxy['User']} arrival_rate={defaults['MaxArrivalRate']}/s in_system={defaults['MaxInSystem']}")
