@@ -5,7 +5,7 @@ runs NMS, then the pipeline keeps one box: the highest-scoring person. Class-wis
 the highest-scoring box of a class, so that box can be read directly from the head's outputs.
 This script measures both paths and compares the boxes they produce.
 
-Usage (inside the image): python profile.py --images DIR [--precision fp16] [--batch 8] [--limit 200]
+Usage (inside the image): python step_timing.py --images DIR [--precision fp16] [--batch 8] [--limit 200]
 """
 import argparse
 import sys

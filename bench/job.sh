@@ -9,6 +9,6 @@ RUN=(docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$WORK:/work" -v "
      -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$IMAGE")
 for config in "fp16 8" "fp16 1" "fp32 8"; do
   set -- $config
-  "${RUN[@]}" python /bench/profile.py --images /work/images --precision "$1" --batch "$2" 2>&1 \
+  "${RUN[@]}" python /bench/step_timing.py --images /work/images --precision "$1" --batch "$2" 2>&1 \
     | grep -v -i "warn\|meshgrid\|Loads checkpoint"
 done
