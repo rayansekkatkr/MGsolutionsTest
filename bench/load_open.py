@@ -1,5 +1,10 @@
 """Open-loop load with real photos: fixed send rate, never waits for answers, 10 s client timeout.
 
+It behaves like an ordinary HTTP client in three respects that matter under overload: the host
+name is resolved once and refreshed in the background rather than for every request, the answer
+is read while the photo is still being uploaded (a server may answer before it has read it all),
+and an exchange ends when Content-Length bytes have arrived.
+
 Same shape as the task's virtual users. Every 200 answer is checked: the request id must come back
 and, when reference results are given, the joints must be within the task's tolerance of the
 reference for that very photo (so a mix-up between requests would show as wrong answers).
@@ -17,6 +22,7 @@ import asyncio
 import json
 import math
 import multiprocessing
+import socket
 import sys
 import time
 from pathlib import Path
@@ -63,38 +69,55 @@ async def send(args, share: int, shares: int, start_at: float) -> list:
     """Sends every `shares`-th request of the schedule, starting with number `share`."""
     target = urlparse(args.url)
     host, port = target.hostname, target.port or 80
-    photos = [(p.name, p.read_bytes()) for p in sorted(args.images.glob("*.jpg"))]
+    photos = [(p.name, p.read_bytes()) for p in sorted(args.images.glob("*.jpg")) if not p.name.startswith(".")]
+    loop = asyncio.get_running_loop()
+
+    async def resolve() -> list:
+        found = await loop.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        return sorted({entry[4][0] for entry in found})
+
+    addresses = await resolve()
+
+    async def keep_resolving() -> None:
+        nonlocal addresses
+        while True:
+            await asyncio.sleep(20)
+            try:
+                addresses = await resolve() or addresses
+            except OSError:
+                pass
+
+    resolver = asyncio.create_task(keep_resolving())
     reference = {}
     if args.reference:
         reference = {row["file"]: row for row in map(json.loads, args.reference.open()) if "file" in row}
-    results = []  # (send offset s, verdict, latency s)
+    results = []  # (send offset s, verdict, latency s, time to connect s)
 
     async def one(i: int, offset: float) -> None:
         name, body = photos[i % len(photos)]
         request_id = f"r{i}"
         started = time.time()
+        connected = None
 
         async def exchange() -> tuple:
-            reader, writer = await asyncio.open_connection(host, port)
+            nonlocal connected
+            reader, writer = await asyncio.open_connection(addresses[i % len(addresses)], port)
+            connected = time.time() - started
             try:
                 writer.write(f"POST /infer HTTP/1.1\r\nHost: {host}\r\nX-Request-Id: {request_id}\r\n"
                              f"Content-Type: image/jpeg\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode())
-                writer.write(body)
-                try:
-                    await writer.drain()
-                except OSError:
-                    pass  # answered before the body was read
+                writer.write(body)  # sent in the background while the answer is awaited
                 return await read_response(reader)
             finally:
-                writer.close()
+                writer.transport.abort()
 
         try:
             outcome = verdict(*await asyncio.wait_for(exchange(), 10), request_id, reference.get(name))
         except asyncio.TimeoutError:
-            outcome = "timeout"
+            outcome = "timeout" if connected is not None else "timeout while connecting"
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             outcome = "connection failed"
-        results.append((offset, outcome, time.time() - started))
+        results.append((offset, outcome, time.time() - started, connected))
 
     total = int(args.rate * args.seconds)
     tasks = []
@@ -105,7 +128,8 @@ async def send(args, share: int, shares: int, start_at: float) -> list:
         tasks.append(asyncio.create_task(one(i, time.time() - start_at)))
     sending_took = time.time() - start_at
     await asyncio.gather(*tasks)
-    return [sending_took, results]
+    resolver.cancel()
+    return [sending_took, results, len(photos), addresses]
 
 
 def send_process(job) -> list:
@@ -139,24 +163,28 @@ def main() -> None:
     results = [row for part in parts for row in part[1]]
 
     counts = {}
-    for _, outcome, _ in results:
+    for _, outcome, _, _ in results:
         counts[outcome] = counts.get(outcome, 0) + 1
-    correct = sorted(latency for _, outcome, latency in results if outcome == "correct")
+    correct = sorted(latency for _, outcome, latency, _ in results if outcome == "correct")
+    connects = sorted(connected for _, _, _, connected in results if connected is not None)
     q = lambda p: 1000 * correct[min(len(correct) - 1, int(p * len(correct)))] if correct else float("nan")
+    c = lambda p: 1000 * connects[min(len(connects) - 1, int(p * len(connects)))] if connects else float("nan")
     others = "  ".join(f"{name}={n}" for name, n in sorted(counts.items()) if name != "correct")
     clock = lambda t: time.strftime("%H:%M:%S", time.gmtime(t))
     print(f"rate {args.rate:g}/s (sent at {total / sending_took:.1f}/s from {clock(start_at)} UTC)  sent={total}  "
           f"correct={len(correct)} ({100 * len(correct) / total:.1f}%, {len(correct) / args.seconds:.1f}/s)  "
           f"p50={q(.5):.0f}ms p95={q(.95):.0f}ms p99={q(.99):.0f}ms  {others}", flush=True)
+    print(f"  {parts[0][2]} photos, {len(parts[0][3])} address(es) for the host, "
+          f"time to connect p50={c(.5):.0f}ms p99={c(.99):.0f}ms max={c(1):.0f}ms", flush=True)
     if args.windows:
         for w in range(int(math.ceil(args.seconds / 10))):
-            window = [outcome for offset, outcome, _ in results if 10 * w <= offset < 10 * (w + 1)]
+            window = [outcome for offset, outcome, _, _ in results if 10 * w <= offset < 10 * (w + 1)]
             if window:
                 print(f"  {clock(start_at + 10 * w)} +{10 * w:<4} {100 * window.count('correct') / len(window):6.2f}% correct of {len(window)}")
 
     failures = []
     wrong = counts.get("wrong", 0)
-    if counts.get("timeout"):
+    if counts.get("timeout") or counts.get("timeout while connecting"):
         failures.append("timeouts")
     if wrong > args.max_wrong_share * (wrong + len(correct)):
         failures.append(f"{wrong} wrong answers")

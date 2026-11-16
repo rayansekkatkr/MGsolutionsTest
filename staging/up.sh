@@ -18,8 +18,10 @@ if (( HOSTS < 2 )); then
   echo "or use a region where the quota is free, e.g. STAGING_REGION=us-east-1 bash staging/up.sh"
   exit 1
 fi
-ZONES="$(aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=g6.xlarge \
-  --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -2 | tr '\n' ' ')"
+# Two zones that offer the instance type. An offering is not a guarantee of capacity at a given
+# moment: STAGING_ZONES="us-east-1c us-east-1d" chooses other zones when a launch fails for lack of it.
+ZONES="${STAGING_ZONES:-$(aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=g6.xlarge \
+  --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -2 | tr '\n' ' ')}"
 set -- $ZONES
 if [[ $# -lt 2 ]]; then echo "Fewer than two zones offer g6.xlarge in $AWS_REGION: $ZONES"; exit 1; fi
 echo "== zones: $1 $2"
@@ -65,7 +67,8 @@ head -60 "$ROOT/tests/inference/images_gpu.txt" | while read -r url; do
   [ -s "$OUT/bundle/photos/$(basename "$url")" ] || curl -fsS --retry 3 -o "$OUT/bundle/photos/$(basename "$url")" "$url"
 done
 cp "$ROOT/bench/load_open.py" "$OUT/bundle/"
-tar -czf "$OUT/bundle.tar.gz" -C "$OUT/bundle" load_open.py photos
+# COPYFILE_DISABLE: macOS tar would otherwise add a "._name" metadata entry next to every file
+COPYFILE_DISABLE=1 tar -czf "$OUT/bundle.tar.gz" --exclude '._*' -C "$OUT/bundle" load_open.py photos
 aws s3 cp --quiet "$OUT/bundle.tar.gz" "s3://$BUCKET/bundle.tar.gz"
 echo "   $(ls "$OUT/bundle/photos" | wc -l | tr -d ' ') photos uploaded"
 
