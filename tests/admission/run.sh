@@ -28,7 +28,7 @@ trap cleanup EXIT
 # The server with the stand-in engine in place of engine.py, settings as in the task definition.
 rm -rf "$OUT/app" && mkdir -p "$OUT/app"
 cp ../../inference/server.py ../../inference/admission.py stand_in/engine.py "$OUT/app/"
-MAX_BATCH="$(cat "$OUT/max_batch.txt")" PRECISION=fp16 python3 "$OUT/app/server.py" > "$OUT/server.log" 2>&1 &
+MAX_BATCH="$(cat "$OUT/max_batch.txt")" MAX_WAITING="$(cat "$OUT/max_waiting.txt")" PRECISION=fp16 python3 "$OUT/app/server.py" > "$OUT/server.log" 2>&1 &
 SERVER=$!
 
 docker pull -q "$IMAGE"
@@ -55,8 +55,8 @@ $LOAD http://127.0.0.1:8081 --rate 2.1 --seconds 20 --min-correct-share 1 --max-
 $LOAD http://127.0.0.1:8081 --rate 21 --seconds 30 --min-correct-share 0.995 --max-p99-ms 300
 
 echo "--- 4. one host's share of stages 4 and 5: answers at capacity, and fast"
-$LOAD http://127.0.0.1:8081 --rate 208 --seconds 20 --min-correct-per-s 33 --max-p99-ms 250
-$LOAD http://127.0.0.1:8081 --rate 750 --seconds 20 --min-correct-per-s 33 --max-p99-ms 250
+$LOAD http://127.0.0.1:8081 --rate 208 --seconds 20 --min-correct-per-s 45 --max-p99-ms 200
+$LOAD http://127.0.0.1:8081 --rate 750 --seconds 20 --procs 2 --min-correct-per-s 45 --max-p99-ms 200
 
 echo "--- 5. back to a light load right after the overload: every request answered again"
 $LOAD http://127.0.0.1:8081 --rate 2.1 --seconds 10 --min-correct-share 1 --max-p99-ms 200

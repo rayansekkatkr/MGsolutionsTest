@@ -35,6 +35,10 @@ Parameters:
     Type: Number
     Default: 3
     Description: Photos per forward pass at most
+  MaxWaiting:
+    Type: Number
+    Default: 4
+    Description: Decoded requests that may wait for the GPU in one inference server
   MaxArrivalRate:
     Type: Number
     Default: 100
@@ -184,6 +188,10 @@ Resources:
           Environment:
             - {Name: PRECISION, Value: fp16}
             - {Name: MAX_BATCH, Value: !Ref MaxBatch}
+            # One more than a batch: with the arrival rate the proxy lets through, the pen then
+            # overflows during every batch under overload, which is what makes the server turn
+            # away the requests a batch leaves behind instead of answering them late.
+            - {Name: MAX_WAITING, Value: !Ref MaxWaiting}
             - {Name: METRIC_NAMESPACE, Value: !Sub "exam-r${RunId}-fleet"}
           User: "10001"
           ReadonlyRootFilesystem: true

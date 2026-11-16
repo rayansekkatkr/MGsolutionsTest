@@ -1,6 +1,6 @@
 """Stand-in for inference/engine.py: same interface, waits instead of computing.
 
-The timing follows the real engine on an L4 at fp16 (about 49, 59, 76 ms for 1, 2, 3 photos).
+The timing follows the real engine on an L4 with its TensorRT engines (about 22, 40, 57 ms for 1, 2, 3 photos).
 The answer depends on the photo, so that an answer returned to the wrong request is detected.
 """
 import time
@@ -22,5 +22,5 @@ class Engine:
         self.device, self.fp16 = "stand-in", precision == "fp16"
 
     def infer(self, images):
-        time.sleep(0.035 + 0.0135 * len(images))
+        time.sleep(0.0045 + 0.0175 * len(images))
         return [answer(image) for image in images]

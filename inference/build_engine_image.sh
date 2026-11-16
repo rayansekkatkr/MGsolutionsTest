@@ -57,7 +57,7 @@ docker run -d --name proxy --network host --init --read-only --user "$(cat "$WOR
   --entrypoint sh "$(cat "$WORK/render/image.txt")" -c "$(cat "$WORK/render/command.txt")" >/dev/null
 # Same constraints as the task definition: non-root, read-only root filesystem, no capabilities.
 docker run -d --name server --gpus all --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
-  --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$(cat "$WORK/render/max_batch.txt")" "$FINAL" >/dev/null
+  --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$(cat "$WORK/render/max_batch.txt")" -e MAX_WAITING="$(cat "$WORK/render/max_waiting.txt")" "$FINAL" >/dev/null
 for i in $(seq 1 90); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health || true)" = 200 ] && break
   sleep 2
