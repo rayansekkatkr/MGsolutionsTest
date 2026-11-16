@@ -45,7 +45,8 @@ def main() -> None:
     parser.add_argument("--images", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--batches", default="1,2,4,8,16")
-    parser.add_argument("--precisions", default="fp32,fp16")
+    parser.add_argument("--precisions", default="fp32,fp16",
+                        help="comma-separated; options are added with +, e.g. fp16+head_fp16+channels_last")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -53,15 +54,16 @@ def main() -> None:
     images = [cv2.imread(str(p), cv2.IMREAD_COLOR) for p in paths]
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (CPU)"
     print(f"photos: {len(images)}  torch {torch.__version__}  GPU: {gpu}", flush=True)
-    print(f"{'precision':9} {'batch':>5} {'photos/s':>9} {'detect ms':>10} {'pose ms':>8}", flush=True)
+    print(f"{'configuration':44} {'batch':>5} {'photos/s':>9} {'detect ms':>10} {'pose ms':>8}", flush=True)
 
     for precision in args.precisions.split(","):
-        engine = Engine(precision=precision)
+        base, *options = precision.split("+")
+        engine = Engine(precision=base, **{name: True for name in options})
         for batch in (int(b) for b in args.batches.split(",")):
             run(engine, images[:2 * batch], batch)  # warm-up for this batch size
             results, detect_s, estimate_s = run(engine, images, batch)
             total = detect_s + estimate_s
-            print(f"{precision:9} {batch:>5} {len(images) / total:>9.1f} {1000 * detect_s / len(images):>10.1f} "
+            print(f"{precision:44} {batch:>5} {len(images) / total:>9.1f} {1000 * detect_s / len(images):>10.1f} "
                   f"{1000 * estimate_s / len(images):>8.1f}", flush=True)
             with (args.out / f"{precision}_b{batch}.jsonl").open("w") as out:
                 for path, (keypoints_2d, keypoints_3d) in zip(paths, results):

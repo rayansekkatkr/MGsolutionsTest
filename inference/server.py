@@ -27,6 +27,8 @@ BATCH_WAIT_MS = float(os.environ.get("BATCH_WAIT_MS", "3"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "64"))
 MAX_AGE_S = float(os.environ.get("MAX_AGE_S", "8"))  # the client gives up after 10 s
 DECODE_THREADS = int(os.environ.get("DECODE_THREADS", "3"))
+WORKERS = int(os.environ.get("WORKERS", "1"))  # batch threads sharing the models
+OPTIONS = {name: os.environ.get(name.upper(), "0") == "1" for name in ("head_fp16", "channels_last", "cudnn_benchmark")}
 
 cv2.setNumThreads(1)  # decoding runs in its own pool; no nested threading
 
@@ -55,7 +57,7 @@ def _resolve(future, result, error):
 
 
 def batch_worker():
-    """Single thread that owns the models."""
+    """Takes whatever is waiting, up to MAX_BATCH, and runs it through both models."""
     wait = BATCH_WAIT_MS / 1000
     while True:
         batch = [State.jobs.get()]
@@ -90,16 +92,18 @@ def load_models():
     from engine import Engine
 
     started = time.monotonic()
-    State.engine = Engine(precision=PRECISION)
+    State.engine = Engine(precision=PRECISION, **OPTIONS)
     # Warm up with the batch sizes used in service so the first real requests are not slower.
     rng = np.random.default_rng(0)
     image = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
     for size in sorted({1, MAX_BATCH}):
         State.engine.infer([image] * size)
-    threading.Thread(target=batch_worker, name="batch", daemon=True).start()
+    for n in range(WORKERS):
+        threading.Thread(target=batch_worker, name=f"batch-{n}", daemon=True).start()
     State.ready = True
     print(f"ready: device={State.engine.device} precision={'fp16' if State.engine.fp16 else 'fp32'} "
-          f"max_batch={MAX_BATCH} in {time.monotonic() - started:.1f} s", flush=True)
+          f"max_batch={MAX_BATCH} workers={WORKERS} options={[k for k, v in OPTIONS.items() if v]} "
+          f"in {time.monotonic() - started:.1f} s", flush=True)
 
 
 def reply(status: int, payload: dict) -> web.Response:

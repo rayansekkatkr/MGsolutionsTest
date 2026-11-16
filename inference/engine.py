@@ -21,7 +21,8 @@ JOINTS = 133
 
 
 class Engine:
-    def __init__(self, precision: str = "fp32", device: str = ""):
+    def __init__(self, precision: str = "fp32", device: str = "", head_fp16: bool = False,
+                 channels_last: bool = False, cudnn_benchmark: bool = False):
         import mmdet
         from mmcv.transforms import Compose as DetCompose
         from mmdet.apis import init_detector
@@ -34,8 +35,11 @@ class Engine:
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.fp16 = precision == "fp16" and self.device.startswith("cuda")
 
-        # Same numerical settings as the reference run.
-        torch.backends.cudnn.benchmark = False
+        self.head_fp16 = head_fp16 and self.fp16
+        self.channels_last = channels_last and self.device.startswith("cuda")
+
+        # Same numerical settings as the reference run, unless a faster option is asked for.
+        torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
@@ -50,6 +54,9 @@ class Engine:
         self.pose_pipeline = PoseCompose(self.pose.cfg.test_dataloader.dataset.pipeline)
 
         self._priors = {}
+        if self.channels_last:
+            self.det.to(memory_format=torch.channels_last)
+            self.pose.to(memory_format=torch.channels_last)
         if self.fp16:
             self._half_precision_features()
 
@@ -60,7 +67,7 @@ class Engine:
         def extract_feat(x):
             with torch.autocast("cuda", dtype=torch.float16):
                 features = extract(x)
-            return tuple(f.float() for f in features)
+            return features if self.head_fp16 else tuple(f.float() for f in features)
 
         self.det.extract_feat = extract_feat
 
@@ -80,7 +87,17 @@ class Engine:
         batch = dict(inputs=[p["inputs"] for p in prepared], data_samples=[p["data_samples"] for p in prepared])
         data = self.det.data_preprocessor(batch, False)
         head = self.det.bbox_head
-        cls_scores, bbox_preds = head(self.det.extract_feat(data["inputs"]))
+        inputs = data["inputs"]
+        if self.channels_last:
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+        features = self.det.extract_feat(inputs)
+        if self.head_fp16:
+            with torch.autocast("cuda", dtype=torch.float16):
+                cls_scores, bbox_preds = head(features)
+            cls_scores = [c.float() for c in cls_scores]
+            bbox_preds = [b.float() for b in bbox_preds]
+        else:
+            cls_scores, bbox_preds = head(features)
 
         sizes = tuple(tuple(c.shape[-2:]) for c in cls_scores)
         if sizes not in self._priors:
