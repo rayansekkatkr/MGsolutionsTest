@@ -27,6 +27,10 @@ if [[ $# -lt 2 ]]; then echo "Fewer than two zones offer g6.xlarge in $AWS_REGIO
 echo "== zones: $1 $2"
 
 # ---- 1. platform: VPC without internet, endpoints, roles, repositories, bucket, load client
+if [[ "$(stack_status "$PLATFORM_STACK")" == DELETE_IN_PROGRESS ]]; then
+  echo "== waiting for the previous platform stack to finish deleting"
+  aws cloudformation wait stack-delete-complete --stack-name "$PLATFORM_STACK"
+fi
 echo "== [1/5] platform stack ($(utc) UTC, about 4 minutes)"
 aws cloudformation deploy --stack-name "$PLATFORM_STACK" --template-file "$ROOT/staging/platform.yaml" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --parameter-overrides "AzA=$1" "AzB=$2"
