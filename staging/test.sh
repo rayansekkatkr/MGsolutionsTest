@@ -54,6 +54,10 @@ IDLE_HOSTS="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-
 echo "== endpoint $URL, $HOSTS hosts, $IDLE_HOSTS when idle"
 echo "== $(fleet)"
 
+echo "== how the inference servers started (one line per host; tensorrt means the engines built for this GPU model loaded):"
+aws logs filter-log-events --log-group-name "/exam-run/r${RUN_ID}/inference" --filter-pattern '"ready"' \
+  --query 'events[].message' --output text | tr '\t' '\n' | sed 's/^/   /'
+
 echo
 echo "== A. stage 1 and 2 shares, every answer expected"
 start_client --rate "$(rate 0.21)" --seconds 60 --min-correct-share 1

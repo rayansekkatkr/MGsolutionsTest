@@ -1,1 +1,1 @@
-{"Inference": "ghcr.io/rayansekkatkr/mgsolutionstest-inference@sha256:ce2f6ac5cc4aa3c0aa9991f2c1869096261f486bb00e1980a3405fa7f91918ed", "Haproxy": "docker.io/library/haproxy:3.0-alpine"}
+{"Inference": "ghcr.io/rayansekkatkr/mgsolutionstest-inference@sha256:0f040d3fc961402af15506b3afc11731d590f9221b064bf1ade924468270c95a", "Haproxy": "docker.io/library/haproxy:3.0-alpine"}
