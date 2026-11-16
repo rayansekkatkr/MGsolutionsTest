@@ -13,7 +13,7 @@ permissions:
 jobs:
   run:
     runs-on: [self-hosted, gpu-l4]
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - run: bash bench/job.sh
