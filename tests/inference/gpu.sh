@@ -6,7 +6,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 IMAGE="${IMAGE:-pose-inference:gpu}"
-WORK="$PWD/tests/inference/out-gpu"
+# Kept outside the checkout: actions/checkout wipes untracked files at the start of every run.
+WORK="$HOME/exam-gpu"
 mkdir -p "$WORK/images" "$WORK/bench"
 trap 'docker rm -f server >/dev/null 2>&1 || true' EXIT
 
@@ -17,10 +18,7 @@ echo "--- 1. build"
 docker build -q -t "$IMAGE" inference
 
 echo "--- 2. photos"
-while read -r url; do
-  [ -s "$WORK/images/$(basename "$url")" ] || curl -fsS --retry 3 -o "$WORK/images/$(basename "$url")" "$url"
-done < tests/inference/images_gpu.txt
-echo "$(ls "$WORK/images" | wc -l) photos"
+bash tests/inference/fetch_images.sh tests/inference/images_gpu.txt "$WORK/images"
 
 RUN=(docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$WORK:/work" -v "$PWD/tests/inference:/tests:ro"
      -v "$PWD/bench:/bench:ro" -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$IMAGE")
