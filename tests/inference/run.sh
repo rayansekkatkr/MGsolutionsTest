@@ -31,8 +31,9 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$WORK:/work" -v "$PWD/tests/infer
   python /tests/reference_run.py --images /work/images --out /work/reference.jsonl | tail -3
 
 echo "--- 4. server, started as the task definition starts it"
+# MAX_AGE_S is raised because a CPU needs seconds per photo; in service the 8 s default applies.
 docker run -d --name server --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
-  --shm-size 1024m -p 8080:8080 -e MAX_BATCH=4 "$IMAGE" >/dev/null
+  --shm-size 1024m -p 8080:8080 -e MAX_BATCH=4 -e MAX_AGE_S=600 "$IMAGE" >/dev/null
 for i in $(seq 1 120); do
   code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || true)"
   [ "$code" = 200 ] && break
