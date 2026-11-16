@@ -46,7 +46,9 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--batches", default="1,2,4,8,16")
     parser.add_argument("--precisions", default="fp32,fp16",
-                        help="comma-separated; options are added with +, e.g. fp16+head_fp16+channels_last")
+                        help="comma-separated; options are added with +, e.g. fp16+head_fp16+channels_last; "
+                             "trt:DET:POSE runs the named TensorRT engines from --trt-dir (- keeps a network in PyTorch fp16)")
+    parser.add_argument("--trt-dir", default="")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -58,7 +60,14 @@ def main() -> None:
 
     for precision in args.precisions.split(","):
         base, *options = precision.split("+")
-        engine = Engine(precision=base, **{name: True for name in options})
+        if base.startswith("trt:"):
+            _, det_name, pose_name = base.split(":")
+            engine = Engine(precision="fp16", trt_dir=args.trt_dir, trt_det=det_name, trt_pose=pose_name)
+            if (det_name != "-" and engine.trt_det is None) or (pose_name != "-" and engine.trt_pose is None):
+                print(f"{precision:44} skipped: engine not loaded", flush=True)
+                continue
+        else:
+            engine = Engine(precision=base, **{name: True for name in options})
         for batch in (int(b) for b in args.batches.split(",")):
             run(engine, images[:2 * batch], batch)  # warm-up for this batch size
             results, detect_s, estimate_s = run(engine, images, batch)

@@ -20,9 +20,38 @@ MIN_PERSON_SCORE = 0.3
 JOINTS = 133
 
 
+class TrtNet:
+    """A TensorRT engine called with one CUDA tensor; returns the named outputs as CUDA tensors."""
+
+    def __init__(self, path: Path, outputs: list):
+        import tensorrt as trt
+
+        self._runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        self._engine = self._runtime.deserialize_cuda_engine(path.read_bytes())
+        if self._engine is None:
+            raise RuntimeError(f"{path.name} could not be loaded by this TensorRT version or GPU")
+        self._context = self._engine.create_execution_context()
+        self._outputs = outputs
+
+    def __call__(self, x: torch.Tensor) -> list:
+        x = x.float().contiguous()
+        self._context.set_input_shape("input", tuple(x.shape))
+        self._context.set_tensor_address("input", x.data_ptr())
+        results = []
+        for name in self._outputs:
+            out = torch.empty(tuple(self._context.get_tensor_shape(name)), dtype=torch.float32, device=x.device)
+            self._context.set_tensor_address(name, out.data_ptr())
+            results.append(out)
+        # Same CUDA stream as PyTorch: whatever reads the outputs next is queued behind this.
+        if not self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+            raise RuntimeError("TensorRT execution failed")
+        return results
+
+
 class Engine:
     def __init__(self, precision: str = "fp32", device: str = "", head_fp16: bool = False,
-                 channels_last: bool = False, cudnn_benchmark: bool = False):
+                 channels_last: bool = False, cudnn_benchmark: bool = False,
+                 trt_dir: str = "", trt_det: str = "det", trt_pose: str = "pose"):
         import mmdet
         from mmcv.transforms import Compose as DetCompose
         from mmdet.apis import init_detector
@@ -57,8 +86,32 @@ class Engine:
         if self.channels_last:
             self.det.to(memory_format=torch.channels_last)
             self.pose.to(memory_format=torch.channels_last)
-        if self.fp16:
+        self.trt_det = self.trt_pose = None
+        if trt_dir and self.device.startswith("cuda"):
+            self._use_tensorrt(Path(trt_dir), trt_det, trt_pose)
+        if self.fp16 and self.trt_det is None:
             self._half_precision_features()
+
+    def _use_tensorrt(self, directory: Path, det_name: str, pose_name: str) -> None:
+        """Replaces the forward pass of a network by its TensorRT engine when DIR/NAME.engine loads.
+
+        Everything around the forward pass is unchanged: the pipelines, the person box read-out
+        and the pose head's own decoding. A network whose engine is missing or does not load
+        (other GPU model, other TensorRT version) keeps running in PyTorch.
+        """
+        try:
+            if det_name != "-":
+                self.trt_det = TrtNet(directory / f"{det_name}.engine", ["cls0", "cls1", "cls2", "box0", "box1", "box2"])
+        except Exception as error:
+            print(f"detector stays in PyTorch: {error!r}", flush=True)
+        try:
+            if pose_name != "-":
+                net = TrtNet(directory / f"{pose_name}.engine", ["out0", "out1", "out2"])
+                self.pose.extract_feat = lambda inputs: inputs       # the engine starts from the image
+                self.pose.head.forward = lambda inputs: tuple(net(inputs))
+                self.trt_pose = net
+        except Exception as error:
+            print(f"pose network stays in PyTorch: {error!r}", flush=True)
 
     def _half_precision_features(self) -> None:
         """fp16 for the detector's backbone and neck only; box decoding and NMS stay in fp32."""
@@ -90,14 +143,17 @@ class Engine:
         inputs = data["inputs"]
         if self.channels_last:
             inputs = inputs.contiguous(memory_format=torch.channels_last)
-        features = self.det.extract_feat(inputs)
-        if self.head_fp16:
+        if self.trt_det is not None:
+            outputs = self.trt_det(inputs)
+            cls_scores, bbox_preds = outputs[:3], outputs[3:]
+        elif self.head_fp16:
+            features = self.det.extract_feat(inputs)
             with torch.autocast("cuda", dtype=torch.float16):
                 cls_scores, bbox_preds = head(features)
             cls_scores = [c.float() for c in cls_scores]
             bbox_preds = [b.float() for b in bbox_preds]
         else:
-            cls_scores, bbox_preds = head(features)
+            cls_scores, bbox_preds = head(self.det.extract_feat(inputs))
 
         sizes = tuple(tuple(c.shape[-2:]) for c in cls_scores)
         if sizes not in self._priors:
@@ -131,7 +187,7 @@ class Engine:
             sample = dict(img=image, bbox=box[None], bbox_score=np.ones(1, dtype=np.float32))
             sample.update(self.pose.dataset_meta)
             samples.append(self.pose_pipeline(sample))
-        if self.fp16:
+        if self.fp16 and self.trt_pose is None:
             with torch.autocast("cuda", dtype=torch.float16):
                 results = self.pose.test_step(pseudo_collate(samples))
         else:
