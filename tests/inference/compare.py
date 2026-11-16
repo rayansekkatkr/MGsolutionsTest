@@ -1,7 +1,7 @@
 """Compares server results with reference results using the task's own rule.
 
 A photo is correct when the mean distance over the 133 joints is at most 3.5 px in 2D and 25 mm in 3D.
-Usage: python compare.py REFERENCE.jsonl CANDIDATE.jsonl [--min-pass 1.0] [--max-2d PX] [--max-3d MM]
+Usage: python compare.py REFERENCE.jsonl CANDIDATE.jsonl [--min-pass 1.0] [--max-2d PX] [--max-3d MM] [--list-failures]
 """
 import argparse
 import json
@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--min-pass", type=float, default=1.0, help="required share of photos within tolerance")
     parser.add_argument("--max-2d", type=float, help="fail if any photo's 2D error exceeds this many pixels")
     parser.add_argument("--max-3d", type=float, help="fail if any photo's 3D error exceeds this many millimetres")
+    parser.add_argument("--list-failures", action="store_true", help="print each photo outside the tolerance")
     args = parser.parse_args()
 
     reference, candidate = load(args.reference), load(args.candidate)
@@ -46,6 +47,11 @@ def main() -> None:
     print(f"photos: {len(reference)}  answered: {len(errors)}  within tolerance: {passed} ({100 * share:.1f}%)")
     print(f"2D error px: mean {sum(e[1] for e in errors) / len(errors):.4f}  max {worst_2d[1]:.4f} ({worst_2d[0]})")
     print(f"3D error mm: mean {sum(e[2] for e in errors) / len(errors):.4f}  max {worst_3d[2]:.4f} ({worst_3d[0]})")
+
+    if args.list_failures:
+        for name, e2, e3 in errors:
+            if e2 > TOLERANCE_2D_PX or e3 > TOLERANCE_3D_MM:
+                print(f"  outside tolerance: {name}  2D {e2:.2f} px  3D {e3:.2f} mm")
 
     failures = []
     if missing:
