@@ -54,7 +54,6 @@ class Job:
 class State:
     ready = False
     pending = 0
-    decoding = 0
     engine = None
     loop = None
     pen = Pen(MAX_WAITING, max_age_s=MAX_AGE_S)
@@ -188,16 +187,14 @@ async def infer(request: web.Request) -> web.Response:
     if not State.ready:
         return reply(503, {"request_id": request_id, "error": "loading"})
     State.signal.arrival()
-    if State.pending >= MAX_PENDING or State.decoding >= 2 * DECODE_THREADS:
-        return turn_away(request_id, "busy")
+    # The body is always read before answering: a proxy handles an answer that arrives while it
+    # is still forwarding the request less predictably than a plain request/answer exchange.
     State.pending += 1
     try:
         body = await request.read()
-        State.decoding += 1
-        try:
-            image = await State.loop.run_in_executor(State.decoders, decode, body)
-        finally:
-            State.decoding -= 1
+        if State.pending > MAX_PENDING:
+            return turn_away(request_id, "busy")
+        image = await State.loop.run_in_executor(State.decoders, decode, body)
         if image is None:
             return reply(400, {"request_id": request_id, "error": "body is not a decodable image"})
         future = State.loop.create_future()
