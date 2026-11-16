@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Staging platform. Stands in for the exam's measurement environment in my own AWS account:
+  a VPC with no internet access, AWS services reachable only through VPC endpoints, the IAM
+  roles the exam passes as parameters, private image repositories and a load client.
+
+Parameters:
+  AzA: {Type: "AWS::EC2::AvailabilityZone::Name", Default: ap-northeast-2a}
+  AzB: {Type: "AWS::EC2::AvailabilityZone::Name", Default: ap-northeast-2c}
+
+Resources:
+  # ---------------- Network: two private subnets, no internet gateway, no NAT ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: exam-staging}]
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.77.1.0/24, AvailabilityZone: !Ref AzA, Tags: [{Key: Name, Value: exam-staging-a}]}
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.77.2.0/24, AvailabilityZone: !Ref AzB, Tags: [{Key: Name, Value: exam-staging-b}]}
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  RouteA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable}
+  RouteB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable}
+
+  # ---------------- Security groups the exam passes in ----------------
+  EndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AWS service endpoints (443)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 10.77.0.0/16}
+  ClientSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: virtual users (load client)
+      VpcId: !Ref Vpc
+
+  # ---------------- VPC endpoints ----------------
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref Vpc
+      RouteTableIds: [!Ref RouteTable]
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  EcsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecs"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  EcsAgentEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecs-agent"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  EcsTelemetryEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecs-telemetry"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+
+  # ---------------- Roles the exam passes in ----------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: ["arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"]
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+
+  # ---------------- Private copies of the images (hosts cannot reach public registries) ----------------
+  HaproxyRepo:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: exam-staging/haproxy, EmptyOnDelete: true}
+  PythonRepo:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: exam-staging/python, EmptyOnDelete: true}
+
+  # ---------------- Load client: plays the exam's virtual users from inside the VPC ----------------
+  ClientCluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterName: exam-staging-client}
+  ClientLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /exam-staging/client, RetentionInDays: 3}
+  ClientTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: exam-staging-client
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "2048"
+      Memory: "4096"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: client
+          Image: !Sub "${PythonRepo.RepositoryUri}:3.12-slim"
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ClientLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: client
+          # Open-loop load: fixed send rate, never waits for answers, 10 s timeout (as in the exam).
+          # Configured through the URL, RATE and SECONDS environment variables at run time.
+          Command:
+            - python
+            - -u
+            - -c
+            - |
+              import asyncio, collections, os, time
+              from urllib.parse import urlparse
+              u = urlparse(os.environ["URL"]); host, port = u.hostname, u.port or 80
+              rate, secs = float(os.environ["RATE"]), float(os.environ["SECONDS"])
+              body = os.urandom(157000); res = []
+              async def call(method, path, rid, payload):
+                  r, w = await asyncio.open_connection(host, port)
+                  try:
+                      head = "%s %s HTTP/1.1\r\nHost: %s\r\nX-Request-Id: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (method, path, host, rid, len(payload))
+                      w.write(head.encode() + payload)
+                      try:
+                          await w.drain()
+                      except OSError:
+                          pass
+                      return await r.read()
+                  finally:
+                      w.close()
+              async def one(i, sent_at):
+                  rid = "r%d" % i; t0 = time.perf_counter()
+                  try:
+                      d = await asyncio.wait_for(call("POST", "/infer", rid, body), 10)
+                      code = d[9:12].decode("ascii", "replace") if d[:5] == b"HTTP/" else "bad"
+                      s = "ok" if code == "200" and rid.encode() in d else code
+                  except asyncio.TimeoutError:
+                      s = "timeout"
+                  except OSError:
+                      s = "conn"
+                  res.append((sent_at, s, time.perf_counter() - t0))
+              def pct(ok, q):
+                  return "%dms" % (ok[min(len(ok) - 1, int(q * len(ok)))] * 1000) if ok else "-"
+              async def main():
+                  for _ in range(30):
+                      try:
+                          d = await asyncio.wait_for(call("GET", "/health", "h", b""), 5)
+                          print("health:", d[:15].decode("ascii", "replace"), flush=True)
+                          if d[9:12] == b"200":
+                              break
+                      except Exception as e:
+                          print("health error:", repr(e), flush=True)
+                      await asyncio.sleep(2)
+                  start = time.time(); t0 = time.perf_counter(); n = int(rate * secs); tasks = []
+                  print("load start utc=%s rate=%s/s seconds=%s" % (time.strftime("%H:%M:%S", time.gmtime(start)), rate, secs), flush=True)
+                  for i in range(n):
+                      d = t0 + i / rate - time.perf_counter()
+                      if d > 0:
+                          await asyncio.sleep(d)
+                      tasks.append(asyncio.create_task(one(i, time.perf_counter() - t0)))
+                  await asyncio.gather(*tasks)
+                  w = 0
+                  while w * 10 < secs:
+                      rows = [r for r in res if w * 10 <= r[0] < w * 10 + 10]
+                      ok = sorted(l for _, s, l in rows if s == "ok")
+                      other = dict(collections.Counter(s for _, s, _ in rows if s != "ok"))
+                      if rows:
+                          print("window utc=%s +%3ds sent=%4d ok=%4d success=%5.1f%% p50=%s p95=%s other=%s" % (time.strftime("%H:%M:%S", time.gmtime(start + w * 10)), w * 10, len(rows), len(ok), 100.0 * len(ok) / len(rows), pct(ok, .5), pct(ok, .95), other), flush=True)
+                      w += 1
+                  ok = sorted(l for _, s, l in res if s == "ok")
+                  other = dict(collections.Counter(s for _, s, _ in res if s != "ok"))
+                  print("total sent=%d ok=%d success=%.2f%% ok_per_s=%.1f p50=%s p95=%s p99=%s other=%s" % (len(res), len(ok), 100.0 * len(ok) / max(1, len(res)), len(ok) / secs, pct(ok, .5), pct(ok, .95), pct(ok, .99), other), flush=True)
+              asyncio.run(main())
+
+Outputs:
+  VpcId: {Value: !Ref Vpc}
+  SubnetIds: {Value: !Join [",", [!Ref SubnetA, !Ref SubnetB]]}
+  ClientSecurityGroupId: {Value: !Ref ClientSg}
+  EndpointSecurityGroupId: {Value: !Ref EndpointSg}
+  TaskExecutionRoleArn: {Value: !GetAtt TaskExecutionRole.Arn}
+  InstanceProfileArn: {Value: !GetAtt InstanceProfile.Arn}
+  HaproxyRepoUri: {Value: !GetAtt HaproxyRepo.RepositoryUri}
+  PythonRepoUri: {Value: !GetAtt PythonRepo.RepositoryUri}
+  ClientTaskArn: {Value: !Ref ClientTask}
