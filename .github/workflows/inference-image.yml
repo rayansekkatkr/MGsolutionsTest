@@ -1,0 +1,21 @@
+name: inference-image
+
+on:
+  push:
+    branches: [round3-inference-image]
+    paths: ["inference/**", "tests/inference/**", ".github/workflows/inference-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space for the PyTorch base image
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL && df -h / | tail -1
+      - name: Build the image and compare the server with the reference APIs
+        run: bash tests/inference/run.sh
