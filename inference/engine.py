@@ -5,6 +5,7 @@ Two things differ from calling `inference_detector` and `inference_topdown` once
 several photos go through each model in one forward pass, and the person box is read directly
 from the detector's outputs instead of going through NMS (see `Engine.detect`).
 """
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -20,8 +21,15 @@ MIN_PERSON_SCORE = 0.3
 JOINTS = 133
 
 
+_lane = threading.local()  # which lane the current thread works in (set by Engine.infer)
+
+
 class TrtNet:
-    """A TensorRT engine called with one CUDA tensor; returns the named outputs as CUDA tensors."""
+    """A TensorRT engine called with one CUDA tensor; returns the named outputs as CUDA tensors.
+
+    Several threads may call it at the same time, each in its own lane: a lane has its own
+    execution context, on its own optimisation profile of the engine.
+    """
 
     def __init__(self, path: Path, outputs: list):
         import tensorrt as trt
@@ -30,20 +38,34 @@ class TrtNet:
         self._engine = self._runtime.deserialize_cuda_engine(path.read_bytes())
         if self._engine is None:
             raise RuntimeError(f"{path.name} could not be loaded by this TensorRT version or GPU")
-        self._context = self._engine.create_execution_context()
+        self.lanes = self._engine.num_optimization_profiles
+        self._contexts = {}
+        self._lock = threading.Lock()
         self._outputs = outputs
 
+    def _context(self):
+        lane = getattr(_lane, "index", 0)
+        context = self._contexts.get(lane)
+        if context is None:
+            with self._lock:
+                context = self._engine.create_execution_context()
+                if lane:
+                    context.set_optimization_profile_async(lane, torch.cuda.current_stream().cuda_stream)
+                self._contexts[lane] = context
+        return context
+
     def __call__(self, x: torch.Tensor) -> list:
+        context = self._context()
         x = x.float().contiguous()
-        self._context.set_input_shape("input", tuple(x.shape))
-        self._context.set_tensor_address("input", x.data_ptr())
+        context.set_input_shape("input", tuple(x.shape))
+        context.set_tensor_address("input", x.data_ptr())
         results = []
         for name in self._outputs:
-            out = torch.empty(tuple(self._context.get_tensor_shape(name)), dtype=torch.float32, device=x.device)
-            self._context.set_tensor_address(name, out.data_ptr())
+            out = torch.empty(tuple(context.get_tensor_shape(name)), dtype=torch.float32, device=x.device)
+            context.set_tensor_address(name, out.data_ptr())
             results.append(out)
-        # Same CUDA stream as PyTorch: whatever reads the outputs next is queued behind this.
-        if not self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+        # Same CUDA stream as this thread's PyTorch work: whatever reads the outputs next is queued behind this.
+        if not context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
             raise RuntimeError("TensorRT execution failed")
         return results
 
@@ -86,6 +108,7 @@ class Engine:
         if self.channels_last:
             self.det.to(memory_format=torch.channels_last)
             self.pose.to(memory_format=torch.channels_last)
+        self._streams, self._lock = {}, threading.Lock()
         self.trt_det = self.trt_pose = None
         if trt_dir and self.device.startswith("cuda"):
             self._use_tensorrt(Path(trt_dir), trt_det, trt_pose)
@@ -241,5 +264,19 @@ class Engine:
             out.append((keypoints_2d, keypoints_3d))
         return out
 
-    def infer(self, images: list) -> list:
+    @property
+    def lanes(self) -> int:
+        """How many threads may call infer() at the same time, each with its own lane number."""
+        return min([net.lanes for net in (self.trt_det, self.trt_pose) if net is not None] or [8])
+
+    def infer(self, images: list, lane: int = 0) -> list:
+        """Runs both models on a batch. Threads working in parallel must each use a different lane:
+        a lane has its own CUDA stream and its own TensorRT execution contexts, so that one
+        thread's CPU work (pipelines, decoding the outputs) overlaps the other's GPU work."""
+        _lane.index = lane
+        if lane and self.device.startswith("cuda"):
+            with self._lock:
+                stream = self._streams.setdefault(lane, torch.cuda.Stream())
+            with torch.cuda.stream(stream):
+                return self.estimate(images, self.detect(images))
         return self.estimate(images, self.detect(images))

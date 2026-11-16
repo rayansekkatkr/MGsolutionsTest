@@ -8,7 +8,10 @@ box the sensitive quantity: a box off by a fraction of a pixel changes the estim
 every joint. TF32 is always switched off: TensorRT enables it by default on recent GPUs, and it
 silently gives "fp32" layers about the precision of fp16.
 
-Usage: python trt_build.py --out DIR [--variants det_bn16,pose_16] [--reuse-onnx]
+An engine is built with several identical optimisation profiles, one per lane: TensorRT gives
+each execution context a profile of its own, and the server runs one context per batch thread.
+
+Usage: python trt_build.py --out DIR [--variants det_bu16,pose_16] [--lanes 3] [--reuse-onnx]
 """
 import argparse
 import sys
@@ -69,7 +72,7 @@ def export(net, network: str, path: Path) -> None:
     print(f"exported {path.name}: {path.stat().st_size / 1e6:.0f} MB", flush=True)
 
 
-def build(onnx_path: Path, engine_path: Path, network: str, fp32_parts) -> None:
+def build(onnx_path: Path, engine_path: Path, network: str, fp32_parts, lanes: int) -> None:
     import tensorrt as trt
 
     logger = trt.Logger(trt.Logger.WARNING)
@@ -96,27 +99,26 @@ def build(onnx_path: Path, engine_path: Path, network: str, fp32_parts) -> None:
                         if layer.get_output(o).dtype == trt.float32:
                             layer.set_output_type(o, trt.float32)
                     kept += 1
-    profile = builder.create_optimization_profile()
     shape = SHAPES[network]
-    profile.set_shape("input", (1, *shape), (3, *shape), (MAX_BATCH, *shape))
-    config.add_optimization_profile(profile)
+    for _ in range(lanes):
+        profile = builder.create_optimization_profile()
+        profile.set_shape("input", (1, *shape), (3, *shape), (MAX_BATCH, *shape))
+        config.add_optimization_profile(profile)
     started = time.time()
     blob = builder.build_serialized_network(definition, config)
     if blob is None:
         raise RuntimeError("engine build failed")
     engine_path.write_bytes(bytes(blob))
     print(f"built {engine_path.name}: {engine_path.stat().st_size / 1e6:.0f} MB in {time.time() - started:.0f} s "
-          f"({definition.num_layers} layers, {kept} pinned to fp32)", flush=True)
-    if fp32_parts:
-        parts = sorted({"/".join(definition.get_layer(i).name.split("/")[1:3]) for i in range(definition.num_layers)})
-        print("  parts of the network:", ", ".join(parts)[:900], flush=True)
+          f"({definition.num_layers} layers, {kept} pinned to fp32, {lanes} lanes)", flush=True)
 
 
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--variants", default="det_bn16,pose_16")
+    parser.add_argument("--variants", default="det_bu16,pose_16")
+    parser.add_argument("--lanes", type=int, default=3, help="execution contexts that can run at the same time")
     parser.add_argument("--reuse-onnx", action="store_true", help="skip the export when the .onnx file is already there")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -133,7 +135,7 @@ def main() -> None:
     torch.cuda.empty_cache()
     for name in wanted:
         network, fp32_parts = VARIANTS[name]
-        build(args.out / f"{network}.onnx", args.out / f"{name}.engine", network, fp32_parts)
+        build(args.out / f"{network}.onnx", args.out / f"{name}.engine", network, fp32_parts, args.lanes)
 
 
 if __name__ == "__main__":

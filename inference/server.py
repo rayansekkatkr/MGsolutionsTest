@@ -3,8 +3,9 @@
 GET  /health  200 once the models are loaded and warmed up
 POST /infer   body = JPEG bytes, header X-Request-Id -> {"request_id", "keypoints_2d", "keypoints_3d"}
 
-Requests are decoded as they arrive and wait in a small pen. Each time the GPU is free the batch
-worker takes up to MAX_BATCH of them, newest first, and runs them through both models together.
+Requests wait in a small pen. Batch workers take up to MAX_BATCH of them, newest first, decode
+them and run them through both models together. With two workers, one prepares its batch on the
+CPU while the other's is on the GPU, so the GPU does not wait.
 Under light load a request is processed alone and at once. When more arrives than the GPU can
 take, the requests that would wait longest are answered 503 immediately (see admission.Pen), so
 the answers that do go out stay fast. The proxy in front caps how many requests reach this process at all.
@@ -28,7 +29,8 @@ from admission import FleetSignal, Pen
 PORT = int(os.environ.get("PORT", "8080"))
 PRECISION = os.environ.get("PRECISION", "fp32")
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "3"))
-MAX_WAITING = int(os.environ.get("MAX_WAITING", "8"))      # decoded requests waiting for the GPU
+MAX_WAITING = int(os.environ.get("MAX_WAITING", "8"))      # requests waiting for a batch worker
+WORKERS = int(os.environ.get("WORKERS", "2"))              # batch workers; at most the engine's lanes
 MAX_AGE_S = float(os.environ.get("MAX_AGE_S", "2"))        # a request that waited longer is answered 503
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "64"))     # requests inside this process, all states
 DECODE_THREADS = int(os.environ.get("DECODE_THREADS", "3"))
@@ -45,16 +47,21 @@ class Busy(Exception):
     pass
 
 
-class Job:
-    __slots__ = ("image", "future")
+class NotAnImage(Exception):
+    pass
 
-    def __init__(self, image, future):
-        self.image, self.future = image, future
+
+class Job:
+    __slots__ = ("body", "future")
+
+    def __init__(self, body, future):
+        self.body, self.future = body, future
 
 
 class State:
     ready = False
     pending = 0
+    workers = 1
     engine = None
     loop = None
     pen = Pen(MAX_WAITING, max_age_s=MAX_AGE_S)
@@ -78,18 +85,26 @@ def _resolve(future, result, error):
         future.set_exception(error)
 
 
-def batch_worker():
-    """Takes the newest waiting requests, up to MAX_BATCH, and runs them through both models."""
+def batch_worker(lane: int):
+    """Takes the newest waiting requests, up to MAX_BATCH, decodes them and runs them through both models."""
     while True:
         taken, turned_away = State.pen.take(MAX_BATCH)
         for job in turned_away:
             State.loop.call_soon_threadsafe(_resolve, job.future, None, Busy())
-        jobs = [job for job in taken if not job.future.cancelled()]  # the client may have gone away
+        taken = [job for job in taken if not job.future.cancelled()]  # the client may have gone away
+        # Decoded here, not on arrival: only requests that are going to be answered cost a decode.
+        jobs, images = [], []
+        for job, image in zip(taken, State.decoders.map(decode, [job.body for job in taken])):
+            if image is None:
+                State.loop.call_soon_threadsafe(_resolve, job.future, None, NotAnImage())
+            else:
+                jobs.append(job)
+                images.append(image)
         if not jobs:
             continue
         started = time.monotonic()
         try:
-            results = State.engine.infer([job.image for job in jobs])
+            results = State.engine.infer(images, lane)
         except Exception as error:  # one bad batch must not stop the worker
             print(f"inference failed for a batch of {len(jobs)}: {error!r}", flush=True)
             for job in jobs:
@@ -154,21 +169,24 @@ def load_models():
         # each size are slower, and the first requests after start should not pay for that.
         rng = np.random.default_rng(0)
         image = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
-        for _ in range(5 if State.engine.device.startswith("cuda") else 1):
-            for size in range(1, MAX_BATCH + 1):
-                State.engine.infer([image] * size)
+        State.workers = max(1, min(WORKERS, State.engine.lanes))
+        for lane in range(State.workers):
+            for _ in range(5 if State.engine.device.startswith("cuda") else 1):
+                for size in range(1, MAX_BATCH + 1):
+                    State.engine.infer([image] * size, lane)
     except Exception as error:
         # A process that can never become ready must not stay up answering 503: exit, so that the
         # container is restarted and the failure is visible.
         print(f"could not load the models: {error!r}", flush=True)
         os._exit(1)
-    threading.Thread(target=batch_worker, name="batch", daemon=True).start()
+    for lane in range(State.workers):
+        threading.Thread(target=batch_worker, args=(lane,), name=f"batch-{lane}", daemon=True).start()
     threading.Thread(target=signal_worker, name="signal", daemon=True).start()
     State.ready = True
     runs = lambda net: "tensorrt" if net is not None else "pytorch"
     print(f"ready: device={State.engine.device} precision={'fp16' if State.engine.fp16 else 'fp32'} "
           f"detector={runs(State.engine.trt_det)} pose={runs(State.engine.trt_pose)} "
-          f"max_batch={MAX_BATCH} max_waiting={MAX_WAITING} options={[k for k, v in OPTIONS.items() if v]} "
+          f"workers={State.workers} max_batch={MAX_BATCH} max_waiting={MAX_WAITING} options={[k for k, v in OPTIONS.items() if v]} "
           f"in {time.monotonic() - started:.1f} s", flush=True)
 
 
@@ -199,17 +217,16 @@ async def infer(request: web.Request) -> web.Response:
         body = await request.read()
         if State.pending > MAX_PENDING:
             return turn_away(request_id, "busy")
-        image = await State.loop.run_in_executor(State.decoders, decode, body)
-        if image is None:
-            return reply(400, {"request_id": request_id, "error": "body is not a decodable image"})
         future = State.loop.create_future()
-        pushed_out = State.pen.put(Job(image, future))
+        pushed_out = State.pen.put(Job(body, future))
         if pushed_out is not None:
             _resolve(pushed_out.future, None, Busy())
         try:
             keypoints_2d, keypoints_3d = await future
         except Busy:
             return turn_away(request_id, "busy")
+        except NotAnImage:
+            return reply(400, {"request_id": request_id, "error": "body is not a decodable image"})
         except Exception:
             return reply(500, {"request_id": request_id, "error": "inference failed"})
         State.served += 1
