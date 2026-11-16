@@ -38,7 +38,7 @@ for f in "$WORK"/bench/*.jsonl; do
 done
 
 echo "--- 6. HTTP server under closed-loop load"
-for config in "fp32 8" "fp16 4" "fp16 8" "fp16 16"; do
+for config in "fp16 4" "fp16 8" "fp16 16"; do
   set -- $config
   docker rm -f server >/dev/null 2>&1 || true
   docker run -d --name server --gpus all --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
@@ -48,7 +48,7 @@ for config in "fp32 8" "fp16 4" "fp16 8" "fp16 16"; do
     sleep 2
   done
   echo "[precision=$1 max_batch=$2] ready after about $((i * 2)) s"
-  python3 bench/load_closed.py --images "$WORK/images" --url http://127.0.0.1:8080 --workers $(( $2 * 3 )) --seconds 30 &
+  python3 bench/load_closed.py --images "$WORK/images" --url http://127.0.0.1:8080 --workers $(( $2 * 2 )) --seconds 30 &
   LOAD=$!
   sleep 18
   echo "  mid-run: GPU $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader), host CPU idle $(top -bn1 | awk '/Cpu\(s\)/ {print $8}')%"

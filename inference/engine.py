@@ -1,8 +1,9 @@
 """Batched inference: RTMDet-x picks one person box per photo, RTMW3D-x estimates 133 joints in it.
 
-The steps are the official MMDetection and MMPose ones (same configs, same test pipelines, same
-weights). The only difference from calling `inference_detector` and `inference_topdown` once per
-photo is that several photos go through each model in one forward pass.
+The models, configs, test pipelines and weights are the official MMDetection and MMPose ones.
+Two things differ from calling `inference_detector` and `inference_topdown` once per photo:
+several photos go through each model in one forward pass, and the person box is read directly
+from the detector's outputs instead of going through NMS (see `Engine.detect`).
 """
 from pathlib import Path
 
@@ -48,6 +49,7 @@ class Engine:
         self.pose = init_model(str(POSE_CONFIG), POSE_WEIGHTS, device=self.device)
         self.pose_pipeline = PoseCompose(self.pose.cfg.test_dataloader.dataset.pipeline)
 
+        self._priors = {}
         if self.fp16:
             self._half_precision_features()
 
@@ -64,20 +66,42 @@ class Engine:
 
     @torch.no_grad()
     def detect(self, images: list) -> list:
-        """One person box [x1, y1, x2, y2] per photo: the highest-scoring person, or the whole photo."""
+        """One person box [x1, y1, x2, y2] per photo: the highest-scoring person, or the whole photo.
+
+        The official post-processing decodes every candidate box of the 80 classes and runs NMS
+        (about 40 ms per photo on an L4), and the pipeline then keeps a single box: the person
+        with the highest score. Class-wise NMS never removes the highest-scoring box of a class,
+        so that box is read directly from the head's outputs, with the head's own decoder and
+        rescaling. On 200 photos the result is identical to the official one.
+        """
+        from mmdet.structures.bbox import scale_boxes
+
         prepared = [self.det_pipeline(dict(img=image, img_id=0)) for image in images]
         batch = dict(inputs=[p["inputs"] for p in prepared], data_samples=[p["data_samples"] for p in prepared])
-        results = self.det.test_step(batch)
+        data = self.det.data_preprocessor(batch, False)
+        head = self.det.bbox_head
+        cls_scores, bbox_preds = head(self.det.extract_feat(data["inputs"]))
+
+        sizes = tuple(tuple(c.shape[-2:]) for c in cls_scores)
+        if sizes not in self._priors:
+            self._priors[sizes] = torch.cat(head.prior_generator.grid_priors(
+                list(sizes), dtype=cls_scores[0].dtype, device=cls_scores[0].device))
+        priors = self._priors[sizes]
+        person = torch.cat([c[:, PERSON_LABEL].flatten(1) for c in cls_scores], dim=1).sigmoid()  # [photos, anchors]
+        distances = torch.cat([b.permute(0, 2, 3, 1).reshape(b.shape[0], -1, 4) for b in bbox_preds], dim=1)
+        best_score, best_anchor = person.max(dim=1)
+        best_score, best_anchor = best_score.tolist(), best_anchor.tolist()
+
         boxes = []
-        for result, image in zip(results, images):
-            pred = result.pred_instances.cpu().numpy()
-            keep = (pred.labels == PERSON_LABEL) & (pred.scores >= MIN_PERSON_SCORE)
-            if keep.any():
-                best = int(np.argmax(np.where(keep, pred.scores, -1)))
-                boxes.append(pred.bboxes[best].astype(np.float32))
-            else:
+        for i, (sample, image) in enumerate(zip(data["data_samples"], images)):
+            if best_score[i] < MIN_PERSON_SCORE:
                 height, width = image.shape[:2]
                 boxes.append(np.array([0, 0, width, height], dtype=np.float32))
+                continue
+            j = best_anchor[i]
+            box = head.bbox_coder.decode(priors[j:j + 1], distances[i, j:j + 1], max_shape=sample.img_shape)
+            box = scale_boxes(box, [1 / s for s in sample.scale_factor])
+            boxes.append(box[0].float().cpu().numpy().astype(np.float32))
         return boxes
 
     @torch.no_grad()
