@@ -40,7 +40,6 @@ QUIET=(-e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 -e NU
        -e OMP_WAIT_POLICY=passive -e OPENCV_FOR_THREADS_NUM=1)
 probe() { docker run --rm --gpus all --cpuset-cpus "$HOST4" -v "$WORK/practice:/photos:ro" -v "$PWD/bench:/bench:ro" "$@" \
             pose-inference:lanes python /bench/phase_probe.py --images /photos 2>&1 | grep -v -i "warn\|meshgrid\|Loads checkpoint\|relative difference" | tail -4 || true; }
-echo "library threads as they are:"; probe
 echo "library threads quietened:";  probe "${QUIET[@]}"
 
 echo "--- 3. the server behind the proxy, overload at 300 requests/s of which the proxy lets 150 through"
@@ -78,24 +77,23 @@ measure() {   # measure PROCESSES WORKERS BATCH WAITING quiet|plain [threads]
   GPU="$( (timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -lms 500 || true) | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n; else printf "?"}')"
   STATS="$(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "${names[@]}" | awk '{c+=$1; m=m" "$2} END {printf "CPU %.0f%%, memory%s", c, m}' || echo '?')"
   GMEM="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader || echo '?')"
+  # Is the GPU itself holding back (power cap, temperature) while it shows less than 100% use?
+  POWER="$(nvidia-smi --query-gpu=power.draw,power.limit,temperature.gpu,clocks.current.graphics,clocks.max.graphics --format=csv,noheader 2>/dev/null | head -1 || echo '?')"
+  THROTTLE="$(nvidia-smi -q 2>/dev/null | grep -i -A12 'throttle reasons\|event reasons' | grep -i ': Active' | tr -s ' ' | tr '\n' ';' || true)"
   if [ -n "$show" ]; then
     echo "   busiest threads of the server:"
     top -H -b -n 1 -p "$(docker inspect -f '{{.State.Pid}}' server1)" | sed -n '8,15p' | awk '{printf "     %s%% %s\n", $9, $12}' || true
   fi
   wait || true
   echo "[processes=$processes workers=$workers batch=$batch waiting=$waiting $mode] $(head -1 "$WORK/load.txt" | sed -E 's/^rate [^)]*\) +sent=[0-9]+ +//')  GPU ${GPU}%, $STATS, GPU memory $GMEM"
+  echo "   GPU power draw, limit, temperature, clock now, clock max: $POWER | holding back: ${THROTTLE:-nothing reported}"
   for name in "${names[@]}"; do docker logs "$name" 2>&1 | grep -E "stays in PyTorch|last 30 s" | tail -1; done
 }
 
-measure 1 1 3 4 plain threads
-measure 1 1 3 4 quiet threads
-measure 1 2 3 4 quiet
-measure 1 2 2 3 quiet
-measure 1 3 2 3 quiet
-measure 2 1 3 4 quiet
-measure 2 1 2 3 quiet
-measure 2 1 3 4 plain
-measure 3 1 2 3 quiet
+measure 1 1 3 4 quiet
 measure 3 1 3 4 quiet
-measure 2 2 2 3 quiet
+measure 1 3 2 3 quiet
+measure 1 1 4 5 quiet
+measure 1 1 2 3 quiet
+measure 1 1 1 2 quiet
 echo "JOB DONE"
