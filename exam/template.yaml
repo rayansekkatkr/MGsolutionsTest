@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  v1.1 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Capacity is driven by two plain
-  CloudWatch alarms on ALB request rate (high traffic -> MaxHosts, quiet traffic -> BaseHosts),
-  applied to both the Auto Scaling group and the ECS service so hosts and tasks stay 1:1.
+  v2 - internal ALB -> ECS (EC2 GPU, 1 task per GPU host). Each task runs an HAProxy admission
+  controller in front of the reference inference container: a bounded number of requests reach
+  the model, the excess is rejected immediately. The fleet is provisioned at full size from
+  creation because a GPU host needs longer to become useful than the load profile allows.
 
 Parameters:
   VpcId: {Type: "AWS::EC2::VPC::Id"}
@@ -15,25 +16,24 @@ Parameters:
   InstanceProfileArn: {Type: String}
   ReferenceImageUri: {Type: String}
   EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
-  BaseHosts:
-    Type: Number
-    Default: 2
-    Description: GPU hosts at creation and whenever traffic is quiet (2 = one host can be killed at any time)
-  MaxHosts:
+  ImageHaproxy:
+    Type: String
+    Description: Official HAProxy image (exam/images.json), used unmodified
+  Hosts:
     Type: Number
     Default: 8
-    Description: Peak GPU hosts (exam cap is 8)
-  ScaleOutRequestsPerMinute:
+    Description: GPU hosts, fixed for the whole run (exam cap is 8). One task per host
+  MaxInFlight:
     Type: Number
-    Default: 200
-    Description: ALB requests/min above which the fleet jumps to MaxHosts (quiet phases send 100/min, stage 2 sends 1,000/min)
-  ScaleInRequestsPerMinute:
+    Default: 2
+    Description: Requests a model container processes at the same time
+  MaxInSystem:
     Type: Number
-    Default: 150
-    Description: ALB requests/min below which the fleet returns to BaseHosts (must stay below ScaleOutRequestsPerMinute)
+    Default: 4
+    Description: Requests admitted per task (in flight + waiting). Above this the proxy answers 503 at once
 
 Resources:
-  # ---------------- Security groups: client -> ALB -> tasks; hosts reach AWS endpoints only ----------------
+  # ---------------- Security groups: client -> ALB -> proxy port; hosts reach AWS endpoints only ----------------
   AlbSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -64,16 +64,16 @@ Resources:
     Properties:
       GroupId: !Ref AlbSg
       IpProtocol: tcp
-      FromPort: 8080
-      ToPort: 8080
+      FromPort: 8081
+      ToPort: 8081
       DestinationSecurityGroupId: !Ref ServiceSg
   ServiceFromAlb:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref ServiceSg
       IpProtocol: tcp
-      FromPort: 8080
-      ToPort: 8080
+      FromPort: 8081
+      ToPort: 8081
       SourceSecurityGroupId: !Ref AlbSg
 
   # ---------------- GPU hosts ----------------
@@ -111,12 +111,11 @@ Resources:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
-      MinSize: !Ref BaseHosts
-      MaxSize: !Ref MaxHosts
-      DesiredCapacity: !Ref BaseHosts
+      MinSize: !Ref Hosts
+      MaxSize: !Ref Hosts
+      DesiredCapacity: !Ref Hosts
       HealthCheckType: EC2
       HealthCheckGracePeriod: 0
-      DefaultInstanceWarmup: 60
       VPCZoneIdentifier: !Ref SubnetIds
       MetricsCollection:
         - Granularity: 1Minute
@@ -125,7 +124,7 @@ Resources:
         LaunchTemplateId: !Ref HostTemplate
         Version: !GetAtt HostTemplate.LatestVersionNumber
 
-  # ---------------- Inference service (container settings = reference design values) ----------------
+  # ---------------- Inference task: admission proxy + reference model container ----------------
   Logs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -141,13 +140,13 @@ Resources:
       Memory: "12288"
       ExecutionRoleArn: !Ref TaskExecutionRoleArn
       ContainerDefinitions:
+        # Reference image, unchanged. Reached only through the proxy on localhost.
         - Name: inference
           Image: !Ref ReferenceImageUri
           Essential: true
           User: "10001"
           ReadonlyRootFilesystem: true
           Privileged: false
-          PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
           ResourceRequirements: [{Type: GPU, Value: "1"}]
           LinuxParameters:
             InitProcessEnabled: true
@@ -168,6 +167,66 @@ Resources:
               awslogs-stream-prefix: inference
               mode: non-blocking
               max-buffer-size: 4m
+        # Admission control. The reference server starts one thread per request with no limit and
+        # keeps computing answers for clients that already timed out. The proxy lets MaxInFlight
+        # requests reach it, holds a short queue, and answers 503 immediately beyond MaxInSystem,
+        # so the GPU only works on requests that can still be answered in time.
+        - Name: proxy
+          Image: !Ref ImageHaproxy
+          Essential: true
+          User: "99"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          PortMappings: [{ContainerPort: 8081, Protocol: tcp}]
+          DependsOn: [{ContainerName: inference, Condition: START}]
+          Ulimits: [{Name: nofile, SoftLimit: 65536, HardLimit: 65536}]
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: {Drop: [ALL]}
+            Tmpfs: [{ContainerPath: /tmp, Size: 16, MountOptions: [rw, nosuid, nodev]}]
+          EntryPoint: [sh, -c]
+          Command:
+            - printf '%s\n' "$HAPROXY_CFG" > /tmp/haproxy.cfg && exec haproxy -db -f /tmp/haproxy.cfg
+          Environment:
+            - Name: HAPROXY_CFG
+              Value: !Sub |
+                global
+                    log stdout format raw local0 notice
+                    nbthread 2
+
+                defaults
+                    mode http
+                    log global
+                    option dontlognull
+                    retries 0
+                    timeout connect 1s
+                    timeout client 15s
+                    timeout server 9s
+                    timeout queue 1s
+                    timeout http-request 5s
+                    timeout http-keep-alive 30s
+
+                frontend entry
+                    bind :8081
+                    acl is_health path /health
+                    acl saturated be_conn(infer) ge ${MaxInSystem}
+                    http-request deny deny_status 503 if !is_health saturated
+                    use_backend health if is_health
+                    default_backend infer
+
+                backend infer
+                    server model 127.0.0.1:8080 maxconn ${MaxInFlight}
+
+                backend health
+                    server model 127.0.0.1:8080
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: proxy
+              mode: non-blocking
+              max-buffer-size: 4m
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -182,10 +241,11 @@ Resources:
       Name: !Sub "exam-r${RunId}-tg"
       TargetType: ip
       Protocol: HTTP
-      Port: 8080
+      Port: 8081
       VpcId: !Ref VpcId
       HealthCheckPath: /health
-      HealthCheckIntervalSeconds: 10
+      HealthCheckIntervalSeconds: 5
+      HealthCheckTimeoutSeconds: 3
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
       TargetGroupAttributes:
@@ -207,7 +267,7 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref Task
       LaunchType: EC2
-      DesiredCount: !Ref BaseHosts
+      DesiredCount: !Ref Hosts
       HealthCheckGracePeriodSeconds: 300
       PlacementConstraints:
         - Type: distinctInstance
@@ -223,103 +283,14 @@ Resources:
           SecurityGroups: [!Ref ServiceSg]
           AssignPublicIp: DISABLED
       LoadBalancers:
-        - {ContainerName: inference, ContainerPort: 8080, TargetGroupArn: !Ref Targets}
-
-  # ---------------- Scaling: the same two alarms drive hosts (ASG) and tasks (ECS) ----------------
-  # The load profile is steep (x10 per stage) while a GPU host needs minutes to boot and pull
-  # the image, so per-request target tracking always lags. Two fixed operating points instead:
-  #   traffic > ScaleOutRequestsPerMinute -> MaxHosts   (first sign of the ramp)
-  #   traffic < ScaleInRequestsPerMinute  -> BaseHosts  (quiet start and cool-down)
-  # The quiet alarm is also in ALARM at the start of the run; there it sets the capacity the
-  # stack was created with, so it is a no-op. The two thresholds never overlap.
-  HostScaleOut:
-    Type: AWS::AutoScaling::ScalingPolicy
-    Properties:
-      AutoScalingGroupName: !Ref HostGroup
-      PolicyType: StepScaling
-      AdjustmentType: ExactCapacity
-      MetricAggregationType: Maximum
-      StepAdjustments:
-        - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref MaxHosts}
-  HostScaleIn:
-    Type: AWS::AutoScaling::ScalingPolicy
-    Properties:
-      AutoScalingGroupName: !Ref HostGroup
-      PolicyType: StepScaling
-      AdjustmentType: ExactCapacity
-      MetricAggregationType: Maximum
-      StepAdjustments:
-        - {MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref BaseHosts}
-  TaskScaling:
-    Type: AWS::ApplicationAutoScaling::ScalableTarget
-    Properties:
-      ServiceNamespace: ecs
-      ScalableDimension: ecs:service:DesiredCount
-      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
-      MinCapacity: !Ref BaseHosts
-      MaxCapacity: !Ref MaxHosts
-  TaskScaleOut:
-    Type: AWS::ApplicationAutoScaling::ScalingPolicy
-    Properties:
-      PolicyName: !Sub "exam-r${RunId}-tasks-out"
-      PolicyType: StepScaling
-      ScalingTargetId: !Ref TaskScaling
-      StepScalingPolicyConfiguration:
-        AdjustmentType: ExactCapacity
-        MetricAggregationType: Maximum
-        Cooldown: 0
-        StepAdjustments:
-          - {MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref MaxHosts}
-  TaskScaleIn:
-    Type: AWS::ApplicationAutoScaling::ScalingPolicy
-    Properties:
-      PolicyName: !Sub "exam-r${RunId}-tasks-in"
-      PolicyType: StepScaling
-      ScalingTargetId: !Ref TaskScaling
-      StepScalingPolicyConfiguration:
-        AdjustmentType: ExactCapacity
-        MetricAggregationType: Maximum
-        Cooldown: 0
-        StepAdjustments:
-          - {MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref BaseHosts}
-  TrafficHighAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "exam-r${RunId}-traffic-high"
-      AlarmDescription: Load ramp detected - go to peak capacity
-      Namespace: AWS/ApplicationELB
-      MetricName: RequestCount
-      Dimensions:
-        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
-      Statistic: Sum
-      Period: 60
-      EvaluationPeriods: 1
-      Threshold: !Ref ScaleOutRequestsPerMinute
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref HostScaleOut, !Ref TaskScaleOut]
-  TrafficQuietAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "exam-r${RunId}-traffic-quiet"
-      AlarmDescription: Traffic is at the quiet level - run on base capacity
-      Namespace: AWS/ApplicationELB
-      MetricName: RequestCount
-      Dimensions:
-        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
-      Statistic: Sum
-      Period: 60
-      EvaluationPeriods: 1
-      Threshold: !Ref ScaleInRequestsPerMinute
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref HostScaleIn, !Ref TaskScaleIn]
+        - {ContainerName: proxy, ContainerPort: 8081, TargetGroupArn: !Ref Targets}
 
   # ---------------- Observability ----------------
   UnhealthyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "exam-r${RunId}-unhealthy-targets"
+      AlarmDescription: At least one task fails its health check
       Namespace: AWS/ApplicationELB
       MetricName: UnHealthyHostCount
       Dimensions:
@@ -331,10 +302,41 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
-  ErrorAlarm:
+  HostsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "exam-r${RunId}-5xx"
+      AlarmName: !Sub "exam-r${RunId}-hosts-below-target"
+      AlarmDescription: Fewer GPU hosts in service than provisioned
+      Namespace: AWS/AutoScaling
+      MetricName: GroupInServiceInstances
+      Dimensions:
+        - {Name: AutoScalingGroupName, Value: !Ref HostGroup}
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref Hosts
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+  SheddingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-load-shedding"
+      AlarmDescription: Tasks are rejecting requests - demand exceeds fleet capacity
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 60
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  EntryErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-alb-5xx"
+      AlarmDescription: The load balancer itself returns errors
       Namespace: AWS/ApplicationELB
       MetricName: HTTPCode_ELB_5XX_Count
       Dimensions:
@@ -351,14 +353,15 @@ Resources:
       DashboardName: !Sub "exam-r${RunId}-overview"
       DashboardBody: !Sub |
         {"widgets": [
-          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Requests / 5xx", "stat": "Sum", "period": 60,
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Requests: total, served, shed by tasks, failed at the ALB", "stat": "Sum", "period": 60,
             "metrics": [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_Target_2XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
                         ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
                         ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
           {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Target response time", "period": 60,
             "metrics": [["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb.LoadBalancerFullName}", {"stat": "p50"}],
                         ["...", {"stat": "p95"}], ["...", {"stat": "p99"}]]}},
-          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts", "stat": "Maximum", "period": 60,
+          {"type": "metric", "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts in service / healthy tasks", "stat": "Minimum", "period": 60,
             "metrics": [["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${HostGroup}"],
                         ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}}
         ]}
