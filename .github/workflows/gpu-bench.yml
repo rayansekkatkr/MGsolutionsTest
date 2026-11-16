@@ -4,7 +4,7 @@ name: gpu-bench
 on:
   push:
     branches: [round3-inference-image]
-    paths: ["bench/**", "inference/**", "tests/inference/gpu.sh", ".github/workflows/gpu-bench.yml"]
+    paths: ["bench/gpu_bench.py", "bench/load_closed.py", "tests/inference/gpu.sh", ".github/workflows/gpu-bench.yml"]
   workflow_dispatch:
 
 permissions:

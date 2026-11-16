@@ -1,0 +1,19 @@
+name: gpu-run
+
+# Runs bench/job.sh on the temporary self-hosted L4 runner. Never triggered by pull requests.
+on:
+  push:
+    branches: [round3-inference-image]
+    paths: ["bench/job.sh"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: [self-hosted, gpu-l4]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash bench/job.sh
