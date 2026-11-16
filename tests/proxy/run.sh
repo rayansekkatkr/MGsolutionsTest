@@ -11,7 +11,7 @@ IMAGE="$(cat out/image.txt)"
 cleanup() {
   echo "--- proxy container logs"; docker logs proxy 2>&1 | tail -20 || true
   docker rm -f proxy >/dev/null 2>&1 || true
-  kill "${STUB:-0}" 2>/dev/null || true
+  kill "${STUB:-0}" "${BASELINE:-0}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -38,9 +38,13 @@ done
 [ "$(docker inspect -f '{{.State.Running}}' proxy)" = true ] || { echo "FAILED: proxy container is not running"; exit 1; }
 echo "ok"
 
-echo "--- 2. baseline: the stand-in server alone at one host's share of stage 3 (collapse expected)"
-python3 load.py 8080 21 20 || true
-sleep 3
+echo "--- 2. baseline: a stand-in server alone at one host's share of stage 3 (collapse expected)"
+# Separate instance on its own port: its backlog of abandoned requests must not leak into step 3.
+python3 stub_server.py 8090 30 90 &
+BASELINE=$!
+sleep 1
+python3 load.py 8090 21 20 || true
+kill "$BASELINE" 2>/dev/null || true
 
 echo "--- 3. behind the proxy: stage 2, 3 and 5 shares per host"
 python3 load.py 8081 2.1 15 --all-ok --max-p95-ms 1000
