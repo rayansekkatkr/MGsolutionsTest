@@ -149,11 +149,13 @@ def load_models():
         from engine import Engine
 
         State.engine = Engine(precision=PRECISION, **OPTIONS)
-        # Warm up with the batch sizes used in service so the first real requests are not slower.
+        # Warm up with the batch sizes used in service, several times over: the first passes of
+        # each size are slower, and the first requests after start should not pay for that.
         rng = np.random.default_rng(0)
         image = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
-        for size in range(1, MAX_BATCH + 1):
-            State.engine.infer([image] * size)
+        for _ in range(5 if State.engine.device.startswith("cuda") else 1):
+            for size in range(1, MAX_BATCH + 1):
+                State.engine.infer([image] * size)
     except Exception as error:
         # A process that can never become ready must not stay up answering 503: exit, so that the
         # container is restarted and the failure is visible.

@@ -26,4 +26,7 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           docker tag pose-inference:test "$REMOTE:${GITHUB_SHA::12}"
           docker push -q "$REMOTE:${GITHUB_SHA::12}"
-          echo "published: $(docker image inspect "$REMOTE:${GITHUB_SHA::12}" --format '{{index .RepoDigests 0}}')"
+          PUBLISHED="$(docker image inspect "$REMOTE:${GITHUB_SHA::12}" --format '{{index .RepoDigests 0}}')"
+          echo "published: $PUBLISHED"
+          docker logout ghcr.io >/dev/null
+          if docker manifest inspect "$PUBLISHED" >/dev/null 2>&1; then echo "readable without logging in: yes"; else echo "readable without logging in: NO (package still private)"; fi
