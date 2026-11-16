@@ -12,11 +12,15 @@
 # Usage: bash inference/build_engine_image.sh DET_VARIANT POSE_VARIANT [MIN_CORRECT_SHARE]   (names from trt_build.py)
 #        REBUILD=1 forces new engines; otherwise engines already built on this machine are reused,
 #        so that the engines published are the ones that were measured.
+#        LANES (default 3) is the number of batches an engine can run at the same time; the server
+#        uses as many as the template's Workers parameter says, at most.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DET="${1:?detector variant}"; POSE="${2:?pose variant}"
 MIN_CORRECT="${3:-0.985}"
 WORK="$HOME/exam-gpu"   # outside the checkout, which is wiped at the start of every run
+LANES="${LANES:-3}"
+ENGINES="$WORK/trt$LANES"
 REF="$WORK/practice_reference.jsonl"
 BASE=pose-inference:base
 FINAL=pose-inference:engines
@@ -27,23 +31,31 @@ TAG="$(git rev-parse --short=12 HEAD)-l4-${DET#det_}"
 echo "--- 1. base image"
 docker build -q -t "$BASE" inference >/dev/null
 
+# A new runner starts empty: the practice photos and the reference results they are checked against.
+mkdir -p "$WORK/practice"
+xargs -P 8 -I{} sh -c '[ -s "$1/$(basename "$2")" ] || curl -fsS --retry 3 -o "$1/$(basename "$2")" "$2"' _ "$WORK/practice" {} \
+  < tests/inference/images_practice.txt
+[ "$(wc -l < "$REF" 2>/dev/null || echo 0)" = 1000 ] || docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$WORK:/work" \
+  -v "$PWD/tests/inference:/tests:ro" -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$BASE" \
+  python /tests/reference_run.py --images /work/practice --out /work/practice_reference.jsonl | tail -1
+
 echo "--- 2. engines: $DET, $POSE"
-mkdir -p "$WORK/trt"
-if [[ "${REBUILD:-0}" == 1 || ! -s "$WORK/trt/$DET.engine" || ! -s "$WORK/trt/$POSE.engine" ]]; then
-  docker run --rm --gpus all --user 0 -v "$WORK/trt:/work" -v "$PWD/inference:/src:ro" \
+mkdir -p "$ENGINES"
+if [[ "${REBUILD:-0}" == 1 || ! -s "$ENGINES/$DET.engine" || ! -s "$ENGINES/$POSE.engine" ]]; then
+  docker run --rm --gpus all --user 0 -v "$ENGINES:/work" -v "$PWD/inference:/src:ro" \
     -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$BASE" bash -c '
       pip install -q --root-user-action=ignore onnx==1.16.2 tensorrt==8.6.1.post1 2>&1 | tail -3
-      python /src/trt_build.py --out /work --variants '"$DET,$POSE"' 2>&1 | grep -v -i "warn\|meshgrid\|Loads checkpoint"
+      python /src/trt_build.py --out /work --lanes '"$LANES"' --variants '"$DET,$POSE"' 2>&1 | grep -v -i "warn\|meshgrid\|Loads checkpoint"
       chown -R '"$(id -u):$(id -g)"' /work'
 fi
-ls -la "$WORK/trt/$DET.engine" "$WORK/trt/$POSE.engine"
-sha256sum "$WORK/trt/$DET.engine" "$WORK/trt/$POSE.engine"
+ls -la "$ENGINES/$DET.engine" "$ENGINES/$POSE.engine"
+sha256sum "$ENGINES/$DET.engine" "$ENGINES/$POSE.engine"
 
 echo "--- 3. final image"
 CONTEXT="$(mktemp -d)"
 trap 'rm -rf "$CONTEXT"; docker rm -f server proxy >/dev/null 2>&1 || true' EXIT
-cp "$WORK/trt/$DET.engine" "$CONTEXT/det.engine"
-cp "$WORK/trt/$POSE.engine" "$CONTEXT/pose.engine"
+cp "$ENGINES/$DET.engine" "$CONTEXT/det.engine"
+cp "$ENGINES/$POSE.engine" "$CONTEXT/pose.engine"
 docker build -q -t "$FINAL" --build-arg "BASE=$BASE" -f inference/Dockerfile.engines "$CONTEXT" >/dev/null
 docker image inspect "$FINAL" --format 'size: {{.Size}} bytes'
 
@@ -57,13 +69,15 @@ docker run -d --name proxy --network host --init --read-only --user "$(cat "$WOR
   --entrypoint sh "$(cat "$WORK/render/image.txt")" -c "$(cat "$WORK/render/command.txt")" >/dev/null
 # Same constraints as the task definition: non-root, read-only root filesystem, no capabilities.
 docker run -d --name server --gpus all --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
-  --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$(cat "$WORK/render/max_batch.txt")" -e MAX_WAITING="$(cat "$WORK/render/max_waiting.txt")" "$FINAL" >/dev/null
+  --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e MAX_BATCH="$(cat "$WORK/render/max_batch.txt")" -e MAX_WAITING="$(cat "$WORK/render/max_waiting.txt")" \
+  -e WORKERS="$(cat "$WORK/render/workers.txt")" "$FINAL" >/dev/null
 for i in $(seq 1 90); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health || true)" = 200 ] && break
   sleep 2
 done
 docker logs server 2>&1 | grep -E "engine|ready|PyTorch" || true
 docker logs server 2>&1 | grep -q "detector=tensorrt pose=tensorrt" || { echo "FAILED: the server is not running both networks in TensorRT"; exit 1; }
+docker logs server 2>&1 | grep -q "workers=$(cat "$WORK/render/workers.txt")" || { echo "FAILED: the server is not running the number of workers the template asks for"; exit 1; }
 load() { python3 bench/load_open.py --images "$WORK/practice" --reference "$REF" --url http://127.0.0.1:8081 "$@"; }
 echo "accuracy on the practice photos, through the whole path:"
 load --rate 12 --seconds 84 --max-wrong-share "$(python3 -c "print(1 - $MIN_CORRECT)")" --min-correct-share "$MIN_CORRECT"

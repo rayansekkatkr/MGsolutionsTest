@@ -40,6 +40,10 @@ Parameters:
     Type: Number
     Default: 4
     Description: Decoded requests that may wait for the GPU in one inference server
+  Workers:
+    Type: Number
+    Default: 1
+    Description: Batches one inference server runs on its GPU at the same time (at most the lanes its engines were built with)
   EdgeTasks:
     Type: Number
     Default: 8
@@ -230,6 +234,7 @@ Resources:
             # overflows during every batch under overload, which is what makes the server turn
             # away the requests a batch leaves behind instead of answering them late.
             - {Name: MAX_WAITING, Value: !Ref MaxWaiting}
+            - {Name: WORKERS, Value: !Ref Workers}
             - {Name: METRIC_NAMESPACE, Value: !Sub "exam-r${RunId}-fleet"}
           User: "10001"
           ReadonlyRootFilesystem: true

@@ -30,7 +30,7 @@ trap cleanup EXIT
 # The server with the stand-in engine in place of engine.py, settings as in the task definition.
 rm -rf "$OUT/app" && mkdir -p "$OUT/app"
 cp ../../inference/server.py ../../inference/admission.py stand_in/engine.py "$OUT/app/"
-MAX_BATCH="$(cat "$OUT/max_batch.txt")" MAX_WAITING="$(cat "$OUT/max_waiting.txt")" PRECISION=fp16 python3 "$OUT/app/server.py" > "$OUT/server.log" 2>&1 &
+MAX_BATCH="$(cat "$OUT/max_batch.txt")" MAX_WAITING="$(cat "$OUT/max_waiting.txt")" WORKERS="$(cat "$OUT/workers.txt")" PRECISION=fp16 python3 "$OUT/app/server.py" > "$OUT/server.log" 2>&1 &
 SERVER=$!
 
 docker pull -q "$IMAGE"
@@ -71,7 +71,7 @@ echo "ok"
 
 echo "--- 7. the whole chain: edge proxy -> fleet ALB stand-in -> two GPU tasks"
 # Second task: a server of its own on another port (the stand-in ALB calls it directly).
-PORT=18080 MAX_BATCH="$(cat "$OUT/max_batch.txt")" MAX_WAITING="$(cat "$OUT/max_waiting.txt")" PRECISION=fp16 \
+PORT=18080 MAX_BATCH="$(cat "$OUT/max_batch.txt")" MAX_WAITING="$(cat "$OUT/max_waiting.txt")" WORKERS="$(cat "$OUT/workers.txt")" PRECISION=fp16 \
   python3 "$OUT/app/server.py" > "$OUT/server_b.log" 2>&1 &
 SERVER_B=$!
 docker run -d --name fleet --network host --user 99 -v "$PWD/fleet_alb.cfg:/fleet_alb.cfg:ro" \

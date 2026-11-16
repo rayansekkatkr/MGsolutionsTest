@@ -3,7 +3,7 @@
 Usage: python render.py TEMPLATE IMAGES_JSON OUT_DIR
 Writes, with parameter defaults substituted, haproxy.cfg, command.txt and user.txt for the proxy
 of a GPU task, edge.cfg, edge_command.txt and edge_user.txt for an edge proxy, and image.txt,
-max_batch.txt, max_waiting.txt, so the test exercises the template itself and not a copy of its
+max_batch.txt, max_waiting.txt, workers.txt, so the test exercises the template itself and not a copy of its
 configuration. The one thing replaced is the fleet ALB's DNS name in the edge configuration,
 which becomes FLEET_ALB (to be set to the address of the stand-in used in the test).
 """
@@ -51,6 +51,7 @@ out.mkdir(parents=True, exist_ok=True)
 (out / "image.txt").write_text(image)
 (out / "max_batch.txt").write_text(str(defaults["MaxBatch"]))
 (out / "max_waiting.txt").write_text(str(defaults["MaxWaiting"]))
+(out / "workers.txt").write_text(str(defaults["Workers"]))
 
 edge = doc["Resources"]["EdgeTask"]["Properties"]["ContainerDefinitions"][0]
 edge_config = next(e for e in edge["Environment"] if e["Name"] == "HAPROXY_CFG")["Value"]["Sub"]
