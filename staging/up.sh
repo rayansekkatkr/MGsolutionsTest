@@ -10,7 +10,7 @@ echo "== account $ACCOUNT, region $AWS_REGION"
 # ---- GPU hosts the account can start here: 4 vCPUs each, minus G instances already running (the benchmark runner)
 QUOTA="$(aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA --query 'Quota.Value' --output text)"
 USED="$(aws ec2 describe-instances --filters "Name=instance-type,Values=g*" "Name=instance-state-name,Values=pending,running" \
-  --query 'length(Reservations[].Instances[?!contains(to_string(Tags), `exam-rstg`)][])' --output text)"
+  --query "length(Reservations[].Instances[?!contains(to_string(Tags), 'exam-rstg')][])" --output text)"
 HOSTS=$(python3 -c "print(min(int('${STAGING_HOSTS:-2}'), int(float('$QUOTA')) // 4 - int('$USED')))")
 echo "== GPU vCPU quota $QUOTA, GPU instances already running outside staging: $USED -> $HOSTS hosts"
 if (( HOSTS < 2 )); then
@@ -49,7 +49,7 @@ INFERENCE_IMAGE="$REGISTRY/exam-staging/inference:candidate"
 "$CRANE" copy --platform linux/amd64 "public.ecr.aws/docker/library/haproxy:$HAPROXY_TAG" "$HAPROXY_IMAGE" >/dev/null
 "$CRANE" copy --platform linux/amd64 "public.ecr.aws/docker/library/python:3.12-slim" "$PYTHON_IMAGE" >/dev/null
 echo "   inference image: $INFERENCE_SOURCE"
-if ! "$CRANE" copy --platform linux/amd64 "$INFERENCE_SOURCE" "$INFERENCE_IMAGE" >/dev/null; then
+if ! "$CRANE" copy "$INFERENCE_SOURCE" "$INFERENCE_IMAGE" >/dev/null; then
   echo "Could not read $INFERENCE_SOURCE without logging in. The exam needs it public as well:"
   echo "GitHub > your profile > Packages > mgsolutionstest-inference > Package settings > Change visibility > Public"
   exit 1
