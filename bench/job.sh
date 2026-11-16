@@ -36,13 +36,13 @@ load() { python3 bench/load_open.py --images "$WORK/practice" --reference "$REF"
 echo "--- 1. template defaults: accuracy through the whole path, then each stage's share for one host"
 serve "$(cat "$WORK/render/max_batch.txt")"
 load --rate 12 --seconds 84 --max-wrong-share 0.02
-load --rate 2.1 --seconds 20
-load --rate 21 --seconds 30
-load --rate 208 --seconds 40 &
+load --rate 2.1 --seconds 20 --max-wrong-share 0.05
+load --rate 21 --seconds 40 --max-wrong-share 0.02
+load --rate 208 --seconds 40 --procs 2 --max-wrong-share 0.02 &
 sleep 25
 echo "  mid-run: GPU $(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader), host CPU idle $(top -bn1 | awk '/Cpu\(s\)/ {print $8}')%"
 wait
-load --rate 750 --seconds 40
+load --rate 750 --seconds 40 --procs 3 --max-wrong-share 0.02
 echo "  quiet for 25 s, then the fleet signal:"
 sleep 25
 docker logs server 2>&1 | grep -E "ready|fleet|last 30 s" | tail -12
@@ -50,7 +50,7 @@ docker logs server 2>&1 | grep -E "ready|fleet|last 30 s" | tail -12
 echo "--- 2. other batch sizes at one host's share of stage 4"
 for batch in 2 4; do
   serve "$batch"
-  load --rate 21 --seconds 20
-  load --rate 208 --seconds 30
+  load --rate 21 --seconds 20 --max-wrong-share 0.03
+  load --rate 208 --seconds 30 --procs 2 --max-wrong-share 0.03
 done
 echo "JOB DONE"
