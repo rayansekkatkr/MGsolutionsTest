@@ -75,7 +75,7 @@ def main():
             print("   " + minute.ljust(6) + "".join(cell.rjust(13) for cell in cells))
 
     print("== fleet alarms: state changes and actions")
-    for alarm in ("fleet-saturated", "fleet-idle", "fleet-idle-from-logs"):
+    for alarm in ("fleet-saturated", "fleet-idle", "fleet-idle-from-logs", "fleet-wake"):
         history = aws(args.region, "cloudwatch", "describe-alarm-history", "--alarm-name", f"exam-r{args.run_id}-{alarm}",
                       "--start-date", args.start, "--end-date", args.end, "--max-items", "40")
         for item in sorted(history.get("AlarmHistoryItems", []), key=lambda item: item["Timestamp"]):

@@ -141,6 +141,26 @@ echo "   what the tasks logged about the fleet:"
 aws logs filter-log-events --log-group-name "/exam-run/r${RUN_ID}/inference" --filter-pattern '"fleet"' --max-items 400 \
   --query 'events[].message' --output text | tr '\t' '\n' | grep -v "^fleet-idle 1$" | tail -20 | sed 's/^/   /'
 
+if [[ "$IDLE_HOSTS" == 0 && -n "$SHRUNK" ]]; then
+  echo
+  echo "== F. the fleet is at rest: 12 requests/s for 150 s should start the hosts again (they are refused meanwhile)"
+  WAKE_START=$SECONDS
+  start_client --rate 12 --seconds 150
+  WOKE=""
+  for _ in $(seq 1 26); do
+    DESIRED="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].DesiredCapacity' --output text)"
+    WAKE="$(aws cloudwatch describe-alarms --alarm-names "exam-r${RUN_ID}-fleet-wake" --query 'MetricAlarms[0].StateValue' --output text)"
+    echo "   +$((SECONDS - WAKE_START)) s: group desired=$DESIRED, alarm fleet-wake=$WAKE"
+    if [[ "$DESIRED" == "$HOSTS" ]]; then WOKE="$((SECONDS - WAKE_START))"; break; fi
+    sleep 8
+  done
+  client_output
+  if [[ -n "$WOKE" ]]; then
+    echo "   FLEET ASKED TO START AGAIN about $WOKE s after requests came back (the hosts then need several minutes)"
+  else
+    echo "   THE FLEET WAS NOT STARTED AGAIN"
+  fi
+fi
 
 echo
 echo "== what AWS recorded during the test"

@@ -157,6 +157,7 @@ Resources:
   # leaves, so the group starts at Hosts and is not grown reactively. It is shrunk to IdleHosts when
   # the tasks report that a peak is over (FleetIdle), and brought back to Hosts when they report
   # that they turn requests away (FleetSaturated). Both signals come from inference/admission.py.
+  # From zero hosts it is the load balancer's own 503s that bring it back (WakeAlarm).
   ShrinkPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
@@ -474,6 +475,25 @@ Resources:
       Threshold: 50
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+  # With IdleHosts at 0 no task is left to report that demand is back. The load balancer answers
+  # 503 itself only when it has no target at all, so its own 503s are the sign that requests are
+  # arriving at a fleet at rest. Above a trickle (5 per second for a minute), start the hosts.
+  WakeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-fleet-wake"
+      AlarmDescription: The fleet is at rest and more than a trickle of requests is arriving - start the hosts
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_503_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref GrowPolicy]
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
