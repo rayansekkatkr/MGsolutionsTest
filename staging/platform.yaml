@@ -5,8 +5,8 @@ Description: >-
   roles the exam passes as parameters, private image repositories and a load client.
 
 Parameters:
-  AzA: {Type: "AWS::EC2::AvailabilityZone::Name", Default: ap-northeast-2a}
-  AzB: {Type: "AWS::EC2::AvailabilityZone::Name", Default: ap-northeast-2c}
+  AzA: {Type: "AWS::EC2::AvailabilityZone::Name", Description: Two zones that offer the GPU instance type}
+  AzB: {Type: "AWS::EC2::AvailabilityZone::Name"}
 
 Resources:
   # ---------------- Network: two private subnets, no internet gateway, no NAT ----------------
@@ -110,7 +110,34 @@ Resources:
       SecurityGroupIds: [!Ref EndpointSg]
       PrivateDnsEnabled: true
 
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.monitoring"
+      VpcId: !Ref Vpc
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+
   # ---------------- Roles the exam passes in ----------------
+  # Task role, with the one permission of the exam's AppRole that the template uses.
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: metrics
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "cloudwatch:PutMetricData"
+                Resource: "*"
+                Condition: {StringLike: {"cloudwatch:namespace": "exam-r*"}}
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -138,6 +165,17 @@ Resources:
   PythonRepo:
     Type: AWS::ECR::Repository
     Properties: {RepositoryName: exam-staging/python, EmptyOnDelete: true}
+  InferenceRepo:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: exam-staging/inference, EmptyOnDelete: true}
+
+  # Holds the load client's bundle (generator script and test photos); fetched through the S3 gateway endpoint.
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
 
   # ---------------- Load client: plays the exam's virtual users from inside the VPC ----------------
   ClientCluster:
@@ -152,8 +190,8 @@ Resources:
       Family: exam-staging-client
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: "2048"
-      Memory: "4096"
+      Cpu: "4096"
+      Memory: "8192"
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: client
@@ -165,73 +203,20 @@ Resources:
               awslogs-group: !Ref ClientLogs
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: client
-          # Open-loop load: fixed send rate, never waits for answers, 10 s timeout (as in the exam).
-          # Configured through the URL, RATE and SECONDS environment variables at run time.
+          # Fetches the bundle (bench/load_open.py and photos) from a pre-signed URL and runs the
+          # generator against URL with the arguments in ARGS. All three are set at run time.
           Command:
             - python
             - -u
             - -c
             - |
-              import asyncio, collections, os, time
-              from urllib.parse import urlparse
-              u = urlparse(os.environ["URL"]); host, port = u.hostname, u.port or 80
-              rate, secs = float(os.environ["RATE"]), float(os.environ["SECONDS"])
-              body = os.urandom(157000); res = []
-              async def call(method, path, rid, payload):
-                  r, w = await asyncio.open_connection(host, port)
-                  try:
-                      head = "%s %s HTTP/1.1\r\nHost: %s\r\nX-Request-Id: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (method, path, host, rid, len(payload))
-                      w.write(head.encode() + payload)
-                      try:
-                          await w.drain()
-                      except OSError:
-                          pass
-                      return await r.read()
-                  finally:
-                      w.close()
-              async def one(i, sent_at):
-                  rid = "r%d" % i; t0 = time.perf_counter()
-                  try:
-                      d = await asyncio.wait_for(call("POST", "/infer", rid, body), 10)
-                      code = d[9:12].decode("ascii", "replace") if d[:5] == b"HTTP/" else "bad"
-                      s = "ok" if code == "200" and rid.encode() in d else code
-                  except asyncio.TimeoutError:
-                      s = "timeout"
-                  except OSError:
-                      s = "conn"
-                  res.append((sent_at, s, time.perf_counter() - t0))
-              def pct(ok, q):
-                  return "%dms" % (ok[min(len(ok) - 1, int(q * len(ok)))] * 1000) if ok else "-"
-              async def main():
-                  for _ in range(30):
-                      try:
-                          d = await asyncio.wait_for(call("GET", "/health", "h", b""), 5)
-                          print("health:", d[:15].decode("ascii", "replace"), flush=True)
-                          if d[9:12] == b"200":
-                              break
-                      except Exception as e:
-                          print("health error:", repr(e), flush=True)
-                      await asyncio.sleep(2)
-                  start = time.time(); t0 = time.perf_counter(); n = int(rate * secs); tasks = []
-                  print("load start utc=%s rate=%s/s seconds=%s" % (time.strftime("%H:%M:%S", time.gmtime(start)), rate, secs), flush=True)
-                  for i in range(n):
-                      d = t0 + i / rate - time.perf_counter()
-                      if d > 0:
-                          await asyncio.sleep(d)
-                      tasks.append(asyncio.create_task(one(i, time.perf_counter() - t0)))
-                  await asyncio.gather(*tasks)
-                  w = 0
-                  while w * 10 < secs:
-                      rows = [r for r in res if w * 10 <= r[0] < w * 10 + 10]
-                      ok = sorted(l for _, s, l in rows if s == "ok")
-                      other = dict(collections.Counter(s for _, s, _ in rows if s != "ok"))
-                      if rows:
-                          print("window utc=%s +%3ds sent=%4d ok=%4d success=%5.1f%% p50=%s p95=%s other=%s" % (time.strftime("%H:%M:%S", time.gmtime(start + w * 10)), w * 10, len(rows), len(ok), 100.0 * len(ok) / len(rows), pct(ok, .5), pct(ok, .95), other), flush=True)
-                      w += 1
-                  ok = sorted(l for _, s, l in res if s == "ok")
-                  other = dict(collections.Counter(s for _, s, _ in res if s != "ok"))
-                  print("total sent=%d ok=%d success=%.2f%% ok_per_s=%.1f p50=%s p95=%s p99=%s other=%s" % (len(res), len(ok), 100.0 * len(ok) / max(1, len(res)), len(ok) / secs, pct(ok, .5), pct(ok, .95), pct(ok, .99), other), flush=True)
-              asyncio.run(main())
+              import io, os, shlex, subprocess, sys, tarfile, urllib.request
+              bundle = urllib.request.urlopen(os.environ["BUNDLE_URL"], timeout=120).read()
+              tarfile.open(fileobj=io.BytesIO(bundle)).extractall("/tmp/bundle")
+              command = [sys.executable, "-u", "/tmp/bundle/load_open.py", "--images", "/tmp/bundle/photos",
+                         "--url", os.environ["URL"]] + shlex.split(os.environ["ARGS"])
+              print("client:", " ".join(command[2:]), flush=True)
+              subprocess.call(command)
 
 Outputs:
   VpcId: {Value: !Ref Vpc}
@@ -239,7 +224,10 @@ Outputs:
   ClientSecurityGroupId: {Value: !Ref ClientSg}
   EndpointSecurityGroupId: {Value: !Ref EndpointSg}
   TaskExecutionRoleArn: {Value: !GetAtt TaskExecutionRole.Arn}
+  AppRoleArn: {Value: !GetAtt AppRole.Arn}
   InstanceProfileArn: {Value: !GetAtt InstanceProfile.Arn}
   HaproxyRepoUri: {Value: !GetAtt HaproxyRepo.RepositoryUri}
   PythonRepoUri: {Value: !GetAtt PythonRepo.RepositoryUri}
+  InferenceRepoUri: {Value: !GetAtt InferenceRepo.RepositoryUri}
+  BucketName: {Value: !Ref Bucket}
   ClientTaskArn: {Value: !Ref ClientTask}
