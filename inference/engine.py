@@ -96,17 +96,39 @@ class Engine:
         """Replaces the forward pass of a network by its TensorRT engine when DIR/NAME.engine loads.
 
         Everything around the forward pass is unchanged: the pipelines, the person box read-out
-        and the pose head's own decoding. A network whose engine is missing or does not load
-        (other GPU model, other TensorRT version) keeps running in PyTorch.
+        and the pose head's own decoding. An engine is only used after it has reproduced the
+        PyTorch network's outputs on a check input. A network whose engine is missing, does not
+        load (other GPU model, other TensorRT version) or fails the check keeps running in PyTorch.
         """
+        @torch.no_grad()
+        def checked(path: Path, outputs: list, shape: tuple, reference) -> TrtNet:
+            net = TrtNet(path, outputs)
+            # A smooth image-like input (not noise) so that activations are in their usual range.
+            rows = torch.linspace(-2, 2, shape[1], device=self.device)[:, None]
+            columns = torch.linspace(-2, 2, shape[2], device=self.device)[None, :]
+            planes = [torch.sin(3 * columns + rows), torch.cos(2 * rows - columns), rows * columns / 2]
+            x = torch.stack([torch.stack(planes), torch.stack(planes[::-1])])  # [2, 3, height, width]
+            expected = reference(x)
+            worst = max(float((a - b).abs().max() / b.abs().max().clamp(min=1e-6)) for a, b in zip(net(x), expected))
+            print(f"{path.name}: largest relative difference from PyTorch on the check input {worst:.4f}", flush=True)
+            if not worst < 0.05:
+                raise RuntimeError(f"{path.name} does not reproduce the PyTorch outputs")
+            return net
+
         try:
             if det_name != "-":
-                self.trt_det = TrtNet(directory / f"{det_name}.engine", ["cls0", "cls1", "cls2", "box0", "box1", "box2"])
+                def det_reference(x):
+                    cls_scores, bbox_preds = self.det.bbox_head(self.det.extract_feat(x))
+                    return [*cls_scores, *bbox_preds]
+                self.trt_det = checked(directory / f"{det_name}.engine", ["cls0", "cls1", "cls2", "box0", "box1", "box2"],
+                                       (3, 640, 640), det_reference)
         except Exception as error:
             print(f"detector stays in PyTorch: {error!r}", flush=True)
         try:
             if pose_name != "-":
-                net = TrtNet(directory / f"{pose_name}.engine", ["out0", "out1", "out2"])
+                extract_feat, forward = self.pose.extract_feat, self.pose.head.forward
+                net = checked(directory / f"{pose_name}.engine", ["out0", "out1", "out2"], (3, 384, 288),
+                              lambda x: list(forward(extract_feat(x))))
                 self.pose.extract_feat = lambda inputs: inputs       # the engine starts from the image
                 self.pose.head.forward = lambda inputs: tuple(net(inputs))
                 self.trt_pose = net

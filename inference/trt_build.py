@@ -25,6 +25,9 @@ VARIANTS = {
     "det_32": ("det", None),
     "det_b16": ("det", ("/neck/", "/head/")),   # backbone in fp16
     "det_bn16": ("det", ("/head/",)),            # backbone and neck in fp16
+    "det_bt16": ("det", ("/head/", "/neck/out_convs", "/neck/bottom_up_blocks", "/neck/downsamples")),  # + neck's top-down half
+    "det_bu16": ("det", ("/head/", "/neck/out_convs", "/neck/top_down_blocks", "/neck/reduce_layers")),  # + neck's bottom-up half
+    "det_bo32": ("det", ("/head/", "/neck/out_convs")),  # backbone and neck in fp16 except the neck's output convolutions
     "det_16": ("det", ()),                       # everything in fp16
     "pose_32": ("pose", None),
     "pose_16": ("pose", ()),
@@ -51,7 +54,8 @@ class PoseNet(torch.nn.Module):
 
     def __init__(self, pose):
         super().__init__()
-        self.backbone, self.neck, self.head = pose.backbone, pose.neck, pose.head
+        self.backbone, self.head = pose.backbone, pose.head
+        self.neck = pose.neck if pose.with_neck else torch.nn.Identity()
 
     def forward(self, x):
         return tuple(self.head(self.neck(self.backbone(x))))
@@ -103,6 +107,9 @@ def build(onnx_path: Path, engine_path: Path, network: str, fp32_parts) -> None:
     engine_path.write_bytes(bytes(blob))
     print(f"built {engine_path.name}: {engine_path.stat().st_size / 1e6:.0f} MB in {time.time() - started:.0f} s "
           f"({definition.num_layers} layers, {kept} pinned to fp32)", flush=True)
+    if fp32_parts:
+        parts = sorted({"/".join(definition.get_layer(i).name.split("/")[1:3]) for i in range(definition.num_layers)})
+        print("  parts of the network:", ", ".join(parts)[:900], flush=True)
 
 
 @torch.no_grad()

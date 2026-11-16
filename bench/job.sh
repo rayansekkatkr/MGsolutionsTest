@@ -11,7 +11,7 @@ docker build -q -t "$IMAGE" inference >/dev/null
 docker run --rm --gpus all --user 0 -v "$WORK:/work" -v "$PWD/bench:/bench:ro" -v "$PWD/inference:/src:ro" \
   -e PYTHONPATH=/app:/opt/mmpose/projects/rtmpose3d "$IMAGE" bash -c '
     pip install -q --root-user-action=ignore onnx==1.16.2 tensorrt==8.6.1.post1 2>&1 | tail -3
-    python /src/trt_build.py --out /work/trt --reuse-onnx --variants det_32,det_b16,det_bn16 2>&1 | grep -v -i "warn\|meshgrid\|Loads checkpoint"
+    python /src/trt_build.py --out /work/trt --reuse-onnx --variants det_bt16,det_bu16,det_bo32 2>&1 | grep -v -i "warn\|meshgrid\|Loads checkpoint"
     python /bench/box_study.py --images /work/practice --reference /work/practice_reference.jsonl --trt-dir /work/trt 2>&1 \
       | grep -v -i "warn\|meshgrid\|Loads checkpoint"
     chown -R '"$(id -u):$(id -g)"' /work/trt'

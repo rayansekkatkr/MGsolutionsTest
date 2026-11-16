@@ -63,7 +63,7 @@ def main():
     images = [cv2.imread(str(p), cv2.IMREAD_COLOR) for p in paths]
     by_file = {row["file"]: row for row in map(json.loads, args.reference.open())}
     reference = [by_file[p.name] for p in paths]
-    margins = (0.02, 0.05, 0.1, 0.2)
+    margins = (0.2,)
 
     exact = Engine(precision="fp32")
     exact_boxes, exact_details = boxes_of(exact, images)
@@ -73,7 +73,8 @@ def main():
     detectors, speed = {}, {}
     for name, kwargs in [("PyTorch fp16", dict(precision="fp16"))] + [
             (f"TensorRT {label}", dict(precision="fp16", trt_dir=args.trt_dir, trt_det=variant, trt_pose="-"))
-            for variant, label in (("det_32", "fp32"), ("det_b16", "backbone fp16"), ("det_bn16", "backbone+neck fp16"))]:
+            for variant, label in (("det_b16", "b16"), ("det_bt16", "b16+top-down"), ("det_bu16", "b16+bottom-up"),
+                                   ("det_bo32", "bn16, out convs fp32"), ("det_bn16", "bn16"))]:
         engine = Engine(**kwargs)
         if "TensorRT" in name and engine.trt_det is None:
             continue
@@ -109,7 +110,7 @@ def main():
     header = f"{'pose network':16} {'detector':28} {'exact boxes':>12} {'own boxes':>10}" + "".join(f"{'fallback ' + str(m):>15}" for m in margins)
     print(header)
     for pose_name, kwargs in [("TensorRT fp16", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="-", trt_pose="pose_fp16")),
-                              ("PyTorch fp16", dict(precision="fp16"))]:
+]:
         engine = Engine(**kwargs)
         with_exact = pass_rate(poses_of(engine, images, exact_boxes), reference)
         for name, (boxes, _) in detectors.items():
