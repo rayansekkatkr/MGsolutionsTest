@@ -75,8 +75,8 @@ measure() {   # measure SERVER_CPUS LOADER_CPUS WORKERS BATCH WAITING DECODE_THR
     --rate 300 --seconds 30 --procs 2 --max-wrong-share 1 > "$WORK/load.txt" &
   sleep 12
   # GPU use averaged over ten seconds in the middle of the load; CPU use of the server container alone.
-  GPU="$(timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -lms 500 | awk '{s+=$1; n++} END {printf "%.0f", s/n}')"
-  CPU="$(docker stats --no-stream --format '{{.CPUPerc}}' server)"
+  GPU="$( (timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -lms 500 || true) | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n; else printf "?"}')"
+  CPU="$(docker stats --no-stream --format '{{.CPUPerc}}' server || echo '?')"
   wait || true
   echo "[cpus=$cpus workers=$workers batch=$batch waiting=$waiting] $(head -1 "$WORK/load.txt" | sed -E 's/^rate [^)]*\) +sent=[0-9]+ +//')  GPU ${GPU}%, server CPU $CPU"
   docker logs server 2>&1 | grep -E "stays in PyTorch|last 30 s" | tail -1
