@@ -2,7 +2,7 @@ name: proxy-test
 
 on:
   push:
-    branches: [round2-admission-proxy]
+    branches: [main, round2-admission-proxy]
   workflow_dispatch:
 
 permissions:

@@ -12,122 +12,130 @@ submitted as a single CloudFormation template and graded by a 37-minute load tes
 | Path | Content |
 | :--- | :--- |
 | `exam/template.yaml` | CloudFormation template (the submission) |
-| `exam/images.json` | Custom image list. `{}` for now: this round uses the reference inference image |
+| `exam/images.json` | Images other than the reference image: the official HAProxy image |
+| `tests/proxy/` | Runs the proxy container exactly as the task definition describes it, under load. Runs in GitHub Actions |
+| `staging/` | Deploys the template into my own AWS account and replays the fault injection before a measurement attempt is spent |
 
 ## Status
 
-| Check | Result |
-| :--- | :--- |
-| Template pre-check (local `template_check.py` and the test site) | Deployable, security 15/15, operations 5/5 |
-| `cfn-lint` (ap-northeast-2) | No errors or warnings |
-| Maximum configuration cost | $7.93/hour, at most $8.20 per measurement |
-| Real deployment and load test | **Not run yet** |
+| Round | Design | Result |
+| :--- | :--- | :--- |
+| 1 | Reference image behind an ALB, 2 hosts scaling to 8 on request rate | 30.99 / 100 |
+| 2 | Admission proxy in front of the model, 8 hosts from creation | Submitted version. Verified in CI and in staging, not measured yet |
 
-Everything below about runtime behaviour is design intent until the first measurement confirms it.
+## What round 1 measured
 
-## The problem in numbers
+| Stage | Demand (requests/s) | Correct answers per second | Success |
+| :--- | ---: | ---: | ---: |
+| 1 | 1.7 | 1.7 | 100% |
+| 2 (fault injection) | 16.7 | 4.6 | 27.67% |
+| 3 | 166.7 | 1.2 | 0.69% |
+| 4 | 1,666.7 | 1.3 | 0.08% |
+| 5 | 6,000 | 1.0 | 0.02% |
 
-The load test raises traffic tenfold per stage, and the template may use at most 8 GPU instances.
-Dividing each stage by 8 gives the throughput every GPU must sustain:
+The stack was created correctly, accuracy was 100% and the fleet did scale to 8 hosts. Three
+things went wrong, and each one maps to a change in round 2:
 
-| Stage | Requests/s | Needed per GPU (8 GPUs) |
-| :--- | ---: | ---: |
-| 1 | 1.67 | 0.2 |
-| 2 | 16.67 | 2.1 |
-| 3 | 166.67 | 20.8 |
-| 4 | 1,666.67 | 208 |
-| 5 | 6,000 | 750 |
+1. **The more load arrived, the less the fleet produced.** A single request takes 121 ms (p50 at
+   stages 1 and 2), so one GPU can serve about 8 requests per second and eight GPUs about 65. The
+   fleet delivered 1.2. The reference server starts one thread per request with no limit; once it
+   falls behind, it spends its time computing answers for clients that already timed out (the
+   logs show `BrokenPipeError` when it tries to send them).
+2. **The fault injection hit stage 2 while only 2 hosts were running**, each already at its limit.
+   Losing one overloaded the other and the service did not recover within the stage: 470 s
+   recovery time. The additional hosts needed most of the stage to become useful.
+3. **Scale-in did not land inside the 6-minute cool-down.** The measured idle cost was exactly
+   8 hosts plus the load balancer.
 
-The reference design notes that the reference image handles about 120 requests per minute per GPU,
-which is 2 requests/s. Result caching is forbidden and every request carries random bytes.
-
-Three conclusions drive the design:
-
-1. **Per-GPU throughput is the dominant lever.** With the reference image the fleet saturates in
-   stage 2. No load balancer or scaling setting changes that; only a faster inference image does.
-2. **Nobody serves the peak fully.** What matters at saturation is how the service fails: quickly
-   and cleanly, while still serving at full capacity.
-3. **Capacity must be ready before a stage starts.** A GPU host needs minutes to boot and pull the
-   image, and each stage lasts 5 to 9 minutes.
-
-## Architecture (v1.1)
+## Architecture (round 2)
 
 ```mermaid
 flowchart LR
     C[Virtual users] -->|HTTP 80| ALB[Internal ALB]
-    ALB -->|8080, least outstanding requests| T1[ECS task on GPU host 1]
-    ALB --> T2[ECS task on GPU host 2]
-    ALB --> TN[... up to 8 hosts]
-    CW[CloudWatch alarms on ALB RequestCount] -->|set capacity| ASG[Auto Scaling group]
-    CW -->|set desired count| SVC[ECS service]
+    ALB -->|8081, least outstanding requests| P1
+    subgraph T1[ECS task on GPU host 1 of 8]
+        P1[HAProxy: 2 in flight, 2 waiting, 503 beyond] -->|localhost 8080| M1[Reference inference container]
+    end
+    ALB --> TN[... 7 more identical tasks]
 ```
 
 - **Entry point**: one internal Application Load Balancer, the only resource the client security
   group can reach.
-- **Compute**: ECS on EC2, `g6.xlarge`, one inference task per GPU host (`distinctInstance`),
-  spread across the two availability zones.
-- **Scaling**: two CloudWatch alarms on the ALB request rate drive both the Auto Scaling group and
-  the ECS service, so hosts and tasks stay one to one.
-- **Observability**: container logs in CloudWatch Logs, four alarms, one dashboard (requests and
-  errors, response time percentiles, host count).
+- **Compute**: ECS on EC2, 8 `g6.xlarge` hosts, one task per host, across two availability zones.
+- **Task**: two containers sharing the task's network. HAProxy receives the traffic and forwards
+  to the reference inference container on localhost. The reference image is not modified.
+- **Observability**: container logs in CloudWatch Logs, four alarms (unhealthy targets, hosts
+  below target, load shedding, load balancer errors), one dashboard.
 
 ## Design decisions
 
-**Two fixed operating points instead of target tracking.** Tracking requests per target reacts
-after the load has arrived, and then waits for hosts to boot. The load profile only has two
-regimes, so the template has two:
+**Admission control in front of the model.** HAProxy lets 2 requests reach the model at a time,
+keeps 2 waiting, and answers 503 immediately to the rest. The GPU only works on requests that can
+still be answered in time, so throughput stays at capacity instead of collapsing, and the latency
+of served requests stays low. A rejected request fails either way; rejecting it in a millisecond
+keeps the capacity for a request that can succeed. `/health` bypasses the limit.
 
-| Traffic on the ALB | Capacity |
-| :--- | :--- |
-| Above 200 requests/min | 8 hosts (the quiet phases send 100/min, stage 2 sends 1,000/min) |
-| Below 150 requests/min | 2 hosts |
+**The full fleet from creation, no scaling policy.** Round 1 measured that additional GPU hosts
+need most of a 9-minute stage to boot, pull the image, load the models and pass health checks.
+The load profile gives 7 minutes between the first request and stage 2. Reactive scaling cannot
+meet that, so capacity is provisioned ahead of the event. The cost score counts the scored
+intervals only, where the fleet is needed anyway.
 
-The thresholds do not overlap, so the two alarms never fight. The quiet alarm is also active at the
-start of the run, where it sets the capacity the stack was created with and changes nothing.
+**Idle cost is not optimised in this round.** A scale-in that cannot complete within the
+cool-down adds risk without benefit. A faster signal is needed first (see roadmap).
 
-**No ECS capacity provider.** Managed scaling removes idle hosts only after a long observation
-window, on the order of 15 minutes. The cool-down phase lasts 6 minutes and its cost is scored, so
-the Auto Scaling group is driven directly by the alarms.
+**Faster failure detection.** Target health checks run every 5 s, the minimum, now that
+admission control keeps the server responsive under overload.
 
-**Two hosts at rest, not one.** One instance is terminated without notice during the test. With two
-hosts the service keeps answering whenever that happens. Running a second idle host costs a little
-on the sustainability score and protects the 20 stability points.
+**Security.** Client to ALB to proxy is the only inbound path, by security group reference. Tasks
+have no outbound access; hosts reach AWS endpoints and S3 only. Both containers run as non-root
+users on a read-only root filesystem with all capabilities dropped. IMDSv2 is enforced with hop
+limit 1 and EBS volumes are encrypted.
 
-**Container settings equal the reference design.** CPU, memory, health check timings and grace
-period are the published reference values. They are changed only when a measurement justifies it.
+## Verification before the measurement
 
-**Security.** Client to ALB to task is the only inbound path, by security group reference. Tasks
-have no outbound access; hosts reach AWS endpoints and S3 only. Containers run as a non-root user
-on a read-only root filesystem with all capabilities dropped. IMDSv2 is enforced with hop limit 1
-and EBS volumes are encrypted.
+A failed stack creation costs a measurement attempt, so round 2 was tested at three levels.
+
+| Level | What ran | Result |
+| :--- | :--- | :--- |
+| Static | Exam pre-check and `cfn-lint` | Deployable, security 15/15, operations 5/5, no lint findings |
+| Container (`tests/proxy`, GitHub Actions) | The official HAProxy image with the task definition's user, read-only filesystem, dropped capabilities, command and configuration, in front of a stand-in server | Starts; 100% served at one host's stage 2 share; at stage 3 and stage 5 shares, throughput stays at the server's capacity with p95 at 360 ms and no timeouts |
+| Staging (`staging/`, my AWS account, VPC without internet) | The template with CPU hosts and a stand-in server, created by CloudFormation, then stage 2 traffic with one host terminated, then overload | Created in 289 s. Host kill: 99.67% success, two 10-second windows below 99%, then 100%. Overload at 150 requests/s: served at capacity, p95 365 ms, no timeouts, all targets healthy |
+
+The stand-in server reproduces the reference server's structure (one thread per request, about
+120 ms each), not its real speed. The same server without the proxy, at one host's stage 3
+share, times out on 45% of requests with a p50 of 5 s.
 
 ## Known limitations
 
-- **Scale-in picks hosts and tasks independently.** The Auto Scaling group and ECS each choose what
-  to keep. A kept task can sit on a terminated host and be restarted on a surviving one. This
-  happens in the cool-down phase, where the success rate is not scored.
-- **Alarm latency.** ALB metrics have one-minute resolution, so each scaling decision trails the
-  traffic change by a minute or more.
-- **Behaviour at saturation is unknown** for the reference image: whether it queues until the
-  10-second client timeout or rejects early. The first measurement will show it.
+- **Throughput per GPU is still the reference image's.** About 8 requests per second per GPU when
+  requests are processed in order; stages 3 to 5 remain far above fleet capacity.
+- **Two simultaneous requests on the real model are untested.** The stand-in cannot tell whether
+  the real server gains or loses from it.
+- **A host loss still costs a few requests**: those in flight on the host, and those routed to it
+  during the two health check intervals the load balancer needs to remove it.
+- **Idle cost** stays at the full fleet.
 
 ## Roadmap
 
-1. **Round 1: baseline.** This template with the reference image. Goal: confirm stack creation,
-   scaling timing, behaviour during fault injection, and get real scores.
-2. **Custom inference image, in steps**, each validated against the 1,000 practice answers with the
-   practice load tool before it is submitted:
-   1. Admission control: reject immediately when the queue is full instead of timing out.
-   2. Dynamic batching. The published tolerance report shows batch 16 matches the reference
-      on all 1,000 practice images.
-   3. fp16, only if accuracy holds. The same report shows 99.2% of images within tolerance
-      with fp16, above the 95% qualification line.
-3. **Rounds 2 and 3**: the custom image, then corrections based on the report.
+- **Round 3: custom inference image.** Dynamic batching and fp16, validated against the 1,000
+  practice answers before submission. The organisers' tolerance report shows batch 16 matching
+  the reference on all practice images and fp16 within tolerance on 99.2% on their pipeline;
+  both have to be confirmed on my own image.
+- **Scale-in on a faster signal**, for example a high-resolution metric published by the service
+  itself, so the fleet can shrink within the cool-down.
 
-## Checking the template locally
+## Running the checks
 
 ```bash
+# static
 pip install pyyaml cfn-lint
 python template_check.py exam/template.yaml exam/images.json   # from the test's policy_kit
 cfn-lint -t exam/template.yaml --regions ap-northeast-2
+
+# container test (needs Docker)
+bash tests/proxy/run.sh
+
+# staging rehearsal (needs an AWS account; see staging/README.md)
+bash staging/up.sh && bash staging/test.sh; bash staging/down.sh
 ```
