@@ -1,3 +1,4 @@
 tests/proxy/out/
 tests/inference/out/
+tests/inference/out-gpu/
 staging/out/

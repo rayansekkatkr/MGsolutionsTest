@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One g6.xlarge (NVIDIA L4, the exam's GPU) registered as a self-hosted GitHub Actions runner, so
+  that GPU benchmarks and accuracy checks run from the repository's workflows. Temporary: it powers
+  itself off after MaxHours and is deleted with the stack.
+
+Parameters:
+  RunnerToken: {Type: String, NoEcho: true, Description: GitHub runner registration token (valid one hour)}
+  RepoUrl: {Type: String}
+  AmiId: {Type: "AWS::EC2::Image::Id", Description: ECS-optimized GPU AMI (NVIDIA driver and container toolkit included)}
+  SubnetId: {Type: "AWS::EC2::Subnet::Id"}
+  VpcId: {Type: "AWS::EC2::VPC::Id"}
+  InstanceType: {Type: String, Default: g6.xlarge}
+  MaxHours: {Type: Number, Default: 8, Description: The instance shuts down and terminates after this many hours}
+
+Resources:
+  Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: GPU runner - outbound only, no inbound access
+      VpcId: !Ref VpcId
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref Role]}
+  Runner:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Profile
+      InstanceInitiatedShutdownBehavior: terminate
+      NetworkInterfaces:
+        - {DeviceIndex: "0", SubnetId: !Ref SubnetId, GroupSet: [!Ref Sg], AssociatePublicIpAddress: true}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 150, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+      Tags: [{Key: Name, Value: exam-gpu-runner}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          # Safety net: power off (which terminates the instance) even if the stack is forgotten.
+          shutdown -h +$(( ${MaxHours} * 60 ))
+          systemctl disable --now ecs || true
+          yum install -y git jq tar gzip libicu
+          usermod -aG docker ec2-user
+          systemctl enable --now docker
+          mkdir -p /opt/runner && cd /opt/runner
+          VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')"
+          curl -fsSL -o runner.tar.gz "https://github.com/actions/runner/releases/download/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz"
+          tar xzf runner.tar.gz && rm runner.tar.gz
+          chown -R ec2-user:ec2-user /opt/runner
+          sudo -u ec2-user ./config.sh --unattended --url "${RepoUrl}" --token "${RunnerToken}" \
+            --name gpu-l4 --labels gpu-l4 --replace
+          ./svc.sh install ec2-user
+          ./svc.sh start
+
+Outputs:
+  InstanceId: {Value: !Ref Runner}
