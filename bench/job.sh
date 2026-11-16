@@ -14,3 +14,4 @@ for config in "fp16 8" "fp16 1" "fp32 8"; do
   "${RUN[@]}" python /bench/step_timing.py --images /work/images --precision "$1" --batch "$2" 2>&1 \
     | grep -v -i "warn\|meshgrid\|Loads checkpoint"
 done
+# rerun 1794806993

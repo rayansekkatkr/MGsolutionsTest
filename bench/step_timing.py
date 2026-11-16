@@ -49,7 +49,7 @@ def direct_boxes(head, cls_scores, bbox_preds, metas, images):
     from mmdet.structures.bbox import scale_boxes
     sizes = [c.shape[-2:] for c in cls_scores]
     priors = torch.cat(head.prior_generator.grid_priors(sizes, dtype=cls_scores[0].dtype,
-                                                        device=cls_scores[0].device, with_stride=True))
+                                                        device=cls_scores[0].device))
     person = torch.cat([c[:, PERSON_LABEL].flatten(1) for c in cls_scores], dim=1).sigmoid()   # [B, anchors]
     boxes_raw = torch.cat([b.permute(0, 2, 3, 1).reshape(b.shape[0], -1, 4) for b in bbox_preds], dim=1)
     score, index = person.max(dim=1)
