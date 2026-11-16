@@ -1,0 +1,10 @@
+# Adds TensorRT and the engines built for one GPU model on top of the inference image.
+# The engines are built by trt_build.py on that GPU model; see build_engine_image.sh.
+# Without this layer, or on a GPU the engines were not built for, the server runs in PyTorch.
+ARG BASE
+FROM ${BASE}
+USER 0
+RUN pip install tensorrt==8.6.1.post1
+COPY det.engine pose.engine /models/trt/
+ENV TRT_DIR=/models/trt
+USER 10001

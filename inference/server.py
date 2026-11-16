@@ -33,6 +33,7 @@ MAX_AGE_S = float(os.environ.get("MAX_AGE_S", "2"))        # a request that wait
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "64"))     # requests inside this process, all states
 DECODE_THREADS = int(os.environ.get("DECODE_THREADS", "3"))
 OPTIONS = {name: os.environ.get(name.upper(), "0") == "1" for name in ("head_fp16", "channels_last", "cudnn_benchmark")}
+TRT_DIR = os.environ.get("TRT_DIR", "")                    # directory with det.engine and pose.engine; empty: PyTorch only
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "")  # empty: no CloudWatch metrics
 IDLE_RATE = float(os.environ.get("IDLE_RATE", "3"))        # requests/s under which this task counts as idle
 SIGNAL_PERIOD_S = float(os.environ.get("SIGNAL_PERIOD_S", "5"))
@@ -148,7 +149,7 @@ def load_models():
     try:
         from engine import Engine
 
-        State.engine = Engine(precision=PRECISION, **OPTIONS)
+        State.engine = Engine(precision=PRECISION, trt_dir=TRT_DIR, **OPTIONS)
         # Warm up with the batch sizes used in service, several times over: the first passes of
         # each size are slower, and the first requests after start should not pay for that.
         rng = np.random.default_rng(0)
@@ -164,7 +165,9 @@ def load_models():
     threading.Thread(target=batch_worker, name="batch", daemon=True).start()
     threading.Thread(target=signal_worker, name="signal", daemon=True).start()
     State.ready = True
+    runs = lambda net: "tensorrt" if net is not None else "pytorch"
     print(f"ready: device={State.engine.device} precision={'fp16' if State.engine.fp16 else 'fp32'} "
+          f"detector={runs(State.engine.trt_det)} pose={runs(State.engine.trt_pose)} "
           f"max_batch={MAX_BATCH} max_waiting={MAX_WAITING} options={[k for k, v in OPTIONS.items() if v]} "
           f"in {time.monotonic() - started:.1f} s", flush=True)
 

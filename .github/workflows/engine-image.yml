@@ -1,0 +1,27 @@
+name: engine-image
+
+# Builds the image with TensorRT engines on the GPU model that will serve it, checks it and publishes it.
+on:
+  push:
+    branches: [round3-inference-image]
+    paths: ["inference/engine_variants.txt", ".github/workflows/engine-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: gpu-runner
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, gpu-l4]
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, check and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash inference/build_engine_image.sh $(cat inference/engine_variants.txt)

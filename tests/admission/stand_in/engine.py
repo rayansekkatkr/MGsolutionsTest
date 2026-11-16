@@ -16,6 +16,8 @@ def answer(image):
 
 
 class Engine:
+    trt_det = trt_pose = None
+
     def __init__(self, precision="fp32", **options):
         self.device, self.fp16 = "stand-in", precision == "fp16"
 

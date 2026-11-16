@@ -109,8 +109,12 @@ class Engine:
             planes = [torch.sin(3 * columns + rows), torch.cos(2 * rows - columns), rows * columns / 2]
             x = torch.stack([torch.stack(planes), torch.stack(planes[::-1])])  # [2, 3, height, width]
             expected = reference(x)
-            worst = max(float((a - b).abs().max() / b.abs().max().clamp(min=1e-6)) for a, b in zip(net(x), expected))
-            print(f"{path.name}: largest relative difference from PyTorch on the check input {worst:.4f}", flush=True)
+            # Typical (median) difference relative to the typical magnitude, per output. Not the
+            # largest one: the box maps go through an exponential, and where there is nothing to
+            # detect their values are huge and meaningless. A wrong or damaged engine is off by
+            # about 1 on this measure, reduced precision by about 0.001.
+            worst = max(float((a - b).abs().median() / b.abs().median().clamp(min=1e-6)) for a, b in zip(net(x), expected))
+            print(f"{path.name}: typical relative difference from PyTorch on the check input {worst:.4f}", flush=True)
             if not worst < 0.05:
                 raise RuntimeError(f"{path.name} does not reproduce the PyTorch outputs")
             return net
