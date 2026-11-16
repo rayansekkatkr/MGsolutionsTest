@@ -11,6 +11,7 @@ Usage: python box_study.py --images DIR --reference FILE.jsonl --trt-dir DIR
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -20,7 +21,7 @@ import torch
 sys.path.insert(0, "/app")
 from engine import Engine, MIN_PERSON_SCORE  # noqa: E402
 
-BATCH = 4
+BATCH = 3
 
 
 def boxes_of(engine, images):
@@ -69,22 +70,28 @@ def main():
     print(f"exact pipeline (PyTorch fp32, direct box): {pass_rate(poses_of(exact, images, exact_boxes), reference):.1f}% within tolerance")
     release(exact)
 
-    detectors = {}
-    for name, kwargs in [("PyTorch fp16", dict(precision="fp16")),
-                         ("TensorRT fp16, head fp32", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="det_fp16_mixed", trt_pose="-")),
-                         ("TensorRT fp16", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="det_fp16", trt_pose="-")),
-                         ("TensorRT fp32", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="det_fp32", trt_pose="-"))]:
+    detectors, speed = {}, {}
+    for name, kwargs in [("PyTorch fp16", dict(precision="fp16"))] + [
+            (f"TensorRT {label}", dict(precision="fp16", trt_dir=args.trt_dir, trt_det=variant, trt_pose="-"))
+            for variant, label in (("det_32", "fp32"), ("det_b16", "backbone fp16"), ("det_bn16", "backbone+neck fp16"))]:
         engine = Engine(**kwargs)
+        if "TensorRT" in name and engine.trt_det is None:
+            continue
+        boxes_of(engine, images[:30])
+        torch.cuda.synchronize()
+        started = time.perf_counter()
         detectors[name] = boxes_of(engine, images)
+        torch.cuda.synchronize()
+        speed[name] = 1000 * (time.perf_counter() - started) / len(images)
         release(engine)
 
     print("\n--- 1. boxes against the exact ones: photos whose box differs by more than N pixels on any side")
-    print(f"{'detector':28} {'>1 px':>7} {'>3 px':>7} {'>10 px':>7} {'>30 px':>7}   median diff px")
+    print(f"{'detector':28} {'>0.3 px':>7} {'>1 px':>7} {'>3 px':>7} {'>10 px':>7}   median diff px   ms per photo (batch {BATCH}, with box read-out)")
     differs = {}
     for name, (boxes, _) in detectors.items():
         diff = np.array([np.abs(a - b).max() for a, b in zip(boxes, exact_boxes)])
         differs[name] = diff
-        print(f"{name:28} {(diff > 1).sum():>7} {(diff > 3).sum():>7} {(diff > 10).sum():>7} {(diff > 30).sum():>7}   {np.median(diff):.3f}")
+        print(f"{name:28} {(diff > 0.3).sum():>7} {(diff > 1).sum():>7} {(diff > 3).sum():>7} {(diff > 10).sum():>7}   {np.median(diff):.3f}   {speed[name]:.1f}")
 
     print("\n--- 2. fallback trigger: best score within MARGIN of a rival box's score, or of the 0.3 threshold")
     print(f"{'detector':28} {'margin':>7} {'photos flagged':>15} {'boxes off by >3 px not flagged':>32}")
@@ -102,7 +109,6 @@ def main():
     header = f"{'pose network':16} {'detector':28} {'exact boxes':>12} {'own boxes':>10}" + "".join(f"{'fallback ' + str(m):>15}" for m in margins)
     print(header)
     for pose_name, kwargs in [("TensorRT fp16", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="-", trt_pose="pose_fp16")),
-                              ("TensorRT fp32", dict(precision="fp16", trt_dir=args.trt_dir, trt_det="-", trt_pose="pose_fp32")),
                               ("PyTorch fp16", dict(precision="fp16"))]:
         engine = Engine(**kwargs)
         with_exact = pass_rate(poses_of(engine, images, exact_boxes), reference)
