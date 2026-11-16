@@ -180,7 +180,7 @@ Resources:
         - Name: inference
           Image: !Ref ImageInference
           Essential: true
-          Cpu: 3584
+          Cpu: 3072
           Environment:
             - {Name: PRECISION, Value: fp16}
             - {Name: MAX_BATCH, Value: !Ref MaxBatch}
