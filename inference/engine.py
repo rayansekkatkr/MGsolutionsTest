@@ -125,7 +125,7 @@ class Engine:
         self.det.extract_feat = extract_feat
 
     @torch.no_grad()
-    def detect(self, images: list) -> list:
+    def detect(self, images: list, details: list = None) -> list:
         """One person box [x1, y1, x2, y2] per photo: the highest-scoring person, or the whole photo.
 
         The official post-processing decodes every candidate box of the 80 classes and runs NMS
@@ -167,6 +167,8 @@ class Engine:
 
         boxes = []
         for i, (sample, image) in enumerate(zip(data["data_samples"], images)):
+            if details is not None:
+                details.append((best_score[i], self._rival_score(head, priors, distances[i], person[i], best_anchor[i], sample)))
             if best_score[i] < MIN_PERSON_SCORE:
                 height, width = image.shape[:2]
                 boxes.append(np.array([0, 0, width, height], dtype=np.float32))
@@ -176,6 +178,19 @@ class Engine:
             box = scale_boxes(box, [1 / s for s in sample.scale_factor])
             boxes.append(box[0].float().cpu().numpy().astype(np.float32))
         return boxes
+
+    @staticmethod
+    def _rival_score(head, priors, distances, person, best_anchor, sample) -> float:
+        """Highest person score among candidates whose box is clearly another box than the best one.
+
+        Neighbouring anchors propose nearly the same box for the same person; they are not rivals.
+        A rival is a candidate that overlaps the best box by less than 70 % (IoU).
+        """
+        from mmdet.structures.bbox import bbox_overlaps
+
+        candidates = head.bbox_coder.decode(priors, distances, max_shape=sample.img_shape).float()
+        overlap = bbox_overlaps(candidates[best_anchor:best_anchor + 1], candidates)[0]
+        return float(person.masked_fill(overlap >= 0.7, 0.0).max())
 
     @torch.no_grad()
     def estimate(self, images: list, boxes: list) -> list:
