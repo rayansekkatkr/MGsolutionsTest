@@ -1,1 +1,1 @@
-det_bn16 pose_fp16 0.97
+det_bu16 pose_fp16 0.98
