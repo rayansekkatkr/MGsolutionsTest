@@ -43,31 +43,56 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$WORK/render:/
 # 150/s is what one host would receive at most from the edge proxies if a host turns out to serve
 # 75 to 85 photos/s; the template's own default is for the 52 photos/s measured with one worker.
 sed 's/be_sess_rate(infer) ge [0-9]*/be_sess_rate(infer) ge 150/' "$WORK/render/haproxy.cfg" > "$WORK/render/haproxy_150.cfg"
-docker rm -f proxy >/dev/null 2>&1 || true
-docker run -d --name proxy --network host --init --read-only --user "$(cat "$WORK/render/user.txt")" --cap-drop ALL \
-  --tmpfs /tmp:rw,nosuid,nodev,size=16m --ulimit nofile=65536:65536 -e HAPROXY_CFG="$(cat "$WORK/render/haproxy_150.cfg")" \
-  --entrypoint sh "$(cat "$WORK/render/image.txt")" -c "$(cat "$WORK/render/command.txt")" >/dev/null
+# On a runner with 8 vCPUs the server gets exactly what a g6.xlarge has (two cores, four threads)
+# and the load generator runs on the other cores, so it no longer takes CPU time from the server.
+# On a 4-vCPU runner they share, and the figures are on the low side.
+if [ "$(nproc)" -ge 8 ]; then
+  echo "thread siblings of cpu0: $(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list)"
+  HOST4="0,1,4,5"; LOAD4="2,3,6,7"; HOST6="0,1,2,4,5,6"; LOAD6="3,7"
+else
+  HOST4="0-3"; LOAD4="0-3"; HOST6=""; LOAD6=""
+fi
 CONTEXT="$(mktemp -d)"
 cp "$WORK/trt3/det_bu16.engine" "$CONTEXT/det.engine"; cp "$WORK/trt3/pose_16.engine" "$CONTEXT/pose.engine"
 docker build -q -t pose-inference:lanes --build-arg "BASE=$BASE" -f inference/Dockerfile.engines "$CONTEXT" >/dev/null
 rm -rf "$CONTEXT"
-# workers:batch:waiting. The first line is the configuration rehearsed on AWS (51.7 photos/s per host there).
-for config in 1:3:4 1:2:3 2:1:2 2:2:3 2:3:4 2:2:5 2:3:7 3:1:2 3:2:3 3:3:4 3:2:5 3:3:7; do
-  IFS=: read -r workers batch waiting <<< "$config"
-  docker rm -f server >/dev/null 2>&1 || true
+
+measure() {   # measure SERVER_CPUS LOADER_CPUS WORKERS BATCH WAITING DECODE_THREADS
+  local cpus="$1" loader="$2" workers="$3" batch="$4" waiting="$5" threads="$6"
+  docker rm -f server proxy >/dev/null 2>&1 || true
+  docker run -d --name proxy --network host --init --read-only --user "$(cat "$WORK/render/user.txt")" --cap-drop ALL \
+    --cpuset-cpus "$cpus" --tmpfs /tmp:rw,nosuid,nodev,size=16m --ulimit nofile=65536:65536 \
+    -e HAPROXY_CFG="$(cat "$WORK/render/haproxy_150.cfg")" \
+    --entrypoint sh "$(cat "$WORK/render/image.txt")" -c "$(cat "$WORK/render/command.txt")" >/dev/null
   docker run -d --name server --gpus all --read-only --user 10001 --cap-drop ALL --tmpfs /tmp:rw,nosuid,nodev,size=2048m \
-    --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e WORKERS="$workers" -e MAX_BATCH="$batch" \
-    -e MAX_WAITING="$waiting" pose-inference:lanes >/dev/null
+    --cpuset-cpus "$cpus" --shm-size 1024m -p 127.0.0.1:8080:8080 -e PRECISION=fp16 -e WORKERS="$workers" -e MAX_BATCH="$batch" \
+    -e MAX_WAITING="$waiting" -e DECODE_THREADS="$threads" pose-inference:lanes >/dev/null
   for i in $(seq 1 90); do
     [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health || true)" = 200 ] && break
     sleep 2
   done
-  python3 bench/load_open.py --images "$WORK/practice" --reference "$REF" --url http://127.0.0.1:8081 \
+  taskset -c "$loader" python3 bench/load_open.py --images "$WORK/practice" --reference "$REF" --url http://127.0.0.1:8081 \
     --rate 300 --seconds 30 --procs 2 --max-wrong-share 1 > "$WORK/load.txt" &
-  sleep 20
-  GPU="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader)"; IDLE="$(top -bn1 | awk '/Cpu\(s\)/ {print $8}')"
+  sleep 12
+  # GPU use averaged over ten seconds in the middle of the load; CPU use of the server container alone.
+  GPU="$(timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -lms 500 | awk '{s+=$1; n++} END {printf "%.0f", s/n}')"
+  CPU="$(docker stats --no-stream --format '{{.CPUPerc}}' server)"
   wait || true
-  echo "[workers=$workers batch=$batch waiting=$waiting] $(head -1 "$WORK/load.txt" | sed -E 's/^rate [^)]*\) +sent=[0-9]+ +//')  GPU $GPU, CPU idle $IDLE%"
+  echo "[cpus=$cpus workers=$workers batch=$batch waiting=$waiting] $(head -1 "$WORK/load.txt" | sed -E 's/^rate [^)]*\) +sent=[0-9]+ +//')  GPU ${GPU}%, server CPU $CPU"
   docker logs server 2>&1 | grep -E "stays in PyTorch|last 30 s" | tail -1
+}
+
+# workers:batch:waiting. The first line is the configuration rehearsed on AWS (51.7 photos/s per host there).
+echo "--- 3a. the server on a g6.xlarge's CPUs"
+for config in 1:3:4 1:2:3 2:1:2 2:2:3 2:3:4 2:2:5 2:3:7 3:1:2 3:2:3 3:3:4 3:2:5 3:3:7; do
+  IFS=: read -r workers batch waiting <<< "$config"
+  measure "$HOST4" "$LOAD4" "$workers" "$batch" "$waiting" 3
 done
+if [ -n "$HOST6" ]; then
+  echo "--- 3b. the same server with half as many CPUs again: is the CPU what holds the GPU back?"
+  for config in 1:3:4 2:3:4 3:2:3 3:3:4 3:3:7; do
+    IFS=: read -r workers batch waiting <<< "$config"
+    measure "$HOST6" "$LOAD6" "$workers" "$batch" "$waiting" 5
+  done
+fi
 echo "JOB DONE"
