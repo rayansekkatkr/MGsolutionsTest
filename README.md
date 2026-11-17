@@ -180,8 +180,9 @@ because nobody has called it yet, and the host loss early in the test meets a fu
 ($0.0004 per minute instead of $0.017 with one host). **The price is that the service is down
 while at rest.** The load balancer answers 503 to whatever arrives, and that is what wakes the
 fleet: a third alarm watches the load balancer's own 503s, which only exist when it has no
-target at all, and sets the group back to eight above 5 requests per second. The hosts then need
-several minutes. A trickle below that rate is refused and does not wake anything.
+target at all, and sets the group back to eight above 5 requests per second. In rehearsal the
+service answered again ten minutes after the first request. A trickle below that rate is
+refused and does not wake anything.
 
 I chose this because the task scores what the quiet period costs and does not score its answers.
 It is a choice for this scoring, not what I would run for users: `IdleHosts: 1` keeps the
@@ -214,13 +215,14 @@ share of one of the exam's eight):
 
 | Check | Result |
 | :--- | :--- |
-| Stack creation | 606 s (limit 1,200 s) |
+| Stack creation | 650 s (limit 1,200 s) |
 | Engines on the hosts | Both hosts started with both networks in TensorRT |
-| Stage 1 to 3 shares | Every request answered; p50 30 ms, p99 38 ms at the stage 3 share |
-| Overload (750 requests/s) | 48.0 correct answers per second per host, p50 57 ms, p95 69 ms, p99 76 ms, no timeouts |
-| After the peak | Idle alarm 15 s after the load dropped; no host running 34 s after it (the scored period starts at 180 s). AWS took 7 minutes to finish terminating them |
+| Stage 1 to 3 shares | Every request answered; p50 30 ms, p99 35 ms at the stage 3 share |
+| Overload (750 requests/s) | 47.2 correct answers per second per host, p50 58 ms, p95 72 ms, p99 176 ms, no timeouts. The run before, same settings: 48.0, p50 57 ms, p95 69 ms, p99 76 ms |
+| After the peak | Idle alarm 21 s after the load dropped; no host running 35 s after it (the scored period starts at 180 s). AWS took 7 minutes to finish terminating them |
 | At rest | Every request refused by the load balancer, as designed |
-| One host terminated at stage 2 load (earlier rehearsal, same load balancer settings) | 19 requests lost in the 9 s the load balancer needed to stop routing to the host, none afterwards |
+| Requests again (12 per second) | Wake-up alarm after 2.5 minutes, hosts asked for at once, service answering again 10 minutes after the first request |
+| One host terminated at stage 2 load | 21 requests lost in the 10 s the load balancer needed to stop routing to the host, none afterwards |
 
 The previous version of this round (batches of three, a waiting room of eight, library threads
 as shipped) measured 51.7 correct answers per second per host with p50 85 ms and p99 202 ms in
@@ -237,8 +239,12 @@ For comparison, round 2 measured 7.7 correct answers per second per host and a p
   distant person, where the fp16 parts move the box by a fraction of a pixel.
 - **The engines are specific to the GPU model** (L4) and TensorRT version. On anything else the
   server runs in PyTorch, at about two thirds of the speed.
-- **A host loss still costs a few requests**: those in flight on the host, and those routed to it
-  until the load balancer's health checks remove it.
+- **A host loss still costs about twenty requests**: those routed to the host until the load
+  balancer's health checks remove it, about 10 s. A task that is told to stop keeps answering for
+  20 s while its health check already fails, which covers a task stopped or replaced by ECS. It
+  did not help for a terminated host: there the server receives the signal twice and stops at the
+  second, and the proxy was gone about 3 s later whatever it did. I measured this in the last
+  rehearsal and left it as measured rather than change the image again without a rehearsal.
 - **At rest the service is down**, and waking takes several minutes. Requests are refused until
   the hosts have started, and a trickle under 5 requests per second does not wake them.
   `IdleHosts: 1` removes this for the price of one host. A fleet that woke up stays at full size
