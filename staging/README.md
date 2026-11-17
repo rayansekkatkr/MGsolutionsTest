@@ -16,7 +16,8 @@ the quiet period after the peak.
 | `g6.xlarge` GPU hosts from the ECS GPU AMI | Same |
 | Virtual users inside the VPC | A Fargate task running `bench/load_open.py`: open loop, real photos, 10 s timeout |
 | 20-minute limit on stack creation | Enforced by `up.sh` |
-| One EC2 host terminated during the test | `STAGING_KILL=1 bash staging/test.sh` terminates one host 45 s into the stage 2 load |
+| One EC2 host terminated during the test | Last phase of `test.sh`: one host is terminated 45 s into the stage 2 load (`STAGING_KILL=0` skips it) |
+| Fleet at rest, then requests again | After the overload the fleet goes to its idle size; with an idle size of 0, `test.sh` then sends requests again and waits for the hosts to serve |
 
 The deployed template is `exam/template.yaml` itself, not a variant. Only one parameter differs
 from the exam: `Hosts` is 2, because my GPU quota is 8 vCPUs. The load is scaled accordingly, so

@@ -12,10 +12,15 @@ the answers that do go out stay fast. The proxy in front caps how many requests 
 
 Every few seconds the process also reports what it sees of the load (admission.FleetSignal) as
 CloudWatch metrics and as a log line; the scaling alarms of the fleet are driven by them.
+
+On SIGTERM (the host or the task is being stopped) the process does not stop at once: /health
+answers 503 from then on, so that the load balancer takes the task out, and /infer keeps
+answering for DRAIN_S seconds, so that the requests still routed here meanwhile are not lost.
 """
 import asyncio
 import json
 import os
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +44,7 @@ TRT_DIR = os.environ.get("TRT_DIR", "")                    # directory with det.
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "")  # empty: no CloudWatch metrics
 IDLE_RATE = float(os.environ.get("IDLE_RATE", "3"))        # requests/s under which this task counts as idle
 SIGNAL_PERIOD_S = float(os.environ.get("SIGNAL_PERIOD_S", "5"))
+DRAIN_S = float(os.environ.get("DRAIN_S", "20"))           # seconds /infer keeps answering after SIGTERM
 
 cv2.setNumThreads(1)  # decoding runs in its own pool; no nested threading
 
@@ -60,6 +66,7 @@ class Job:
 
 class State:
     ready = False
+    stopping = False
     pending = 0
     workers = 1
     engine = None
@@ -202,7 +209,19 @@ def turn_away(request_id: str, reason: str) -> web.Response:
 
 
 async def health(request: web.Request) -> web.Response:
+    if State.stopping:
+        return reply(503, {"status": "stopping"})
     return reply(200, {"status": "ok"}) if State.ready else reply(503, {"status": "loading"})
+
+
+def stop() -> None:
+    """SIGTERM or SIGINT. A second signal, or one received before the models are ready, stops at once."""
+    if State.stopping or not State.ready or DRAIN_S <= 0:
+        print("stopped", flush=True)
+        os._exit(0)
+    State.stopping = True
+    print(f"stopping: /health answers 503 from now on, /infer keeps answering for {DRAIN_S:.0f} s", flush=True)
+    State.loop.call_later(DRAIN_S, stop)
 
 
 async def infer(request: web.Request) -> web.Response:
@@ -239,6 +258,8 @@ async def infer(request: web.Request) -> web.Response:
 
 async def on_startup(app: web.Application) -> None:
     State.loop = asyncio.get_running_loop()
+    for number in (signal.SIGTERM, signal.SIGINT):
+        State.loop.add_signal_handler(number, stop)
     threading.Thread(target=load_models, name="load", daemon=True).start()
 
 
@@ -248,7 +269,7 @@ def main() -> None:
     app.router.add_post("/infer", infer)
     app.on_startup.append(on_startup)
     print(f"listening on 0.0.0.0:{PORT} (loading models)", flush=True)
-    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None, print=None)
+    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None, print=None, handle_signals=False)
 
 
 if __name__ == "__main__":

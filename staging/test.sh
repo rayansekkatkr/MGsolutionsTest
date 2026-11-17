@@ -67,39 +67,6 @@ client_output
 start_client --rate "$(rate 2.1)" --seconds 60 --min-correct-share 1 --max-p99-ms 300
 client_output
 
-# The host kill is off by default. It was measured in the first rehearsal (19 requests lost in the
-# nine seconds the load balancer needed to stop routing to the host, none afterwards) and in the
-# round 2 measurement itself, with the same load balancer settings. It leaves the fleet waiting
-# for a replacement host, and a pending launch makes AWS refuse the shrink that phase E checks.
-if [[ "${STAGING_KILL:-0}" == 1 ]]; then
-  echo
-  echo "== B. stage 2 share for 180 s with one host terminated without notice after 45 s"
-  start_client --rate "$(rate 2.1)" --seconds 180 --windows
-  sleep 45
-  VICTIM="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)"
-  KILLED_AT=$SECONDS
-  echo "KILL utc=$(utc) instance=$VICTIM"
-  aws ec2 terminate-instances --instance-ids "$VICTIM" --query 'TerminatingInstances[0].CurrentState.Name' --output text
-  for _ in $(seq 1 12); do sleep 10; echo "   utc=$(utc) healthy targets: $(healthy)/$HOSTS"; done
-  client_output
-
-  echo
-  echo "== waiting for the replacement host (up to 12 minutes)"
-  while (( SECONDS - KILLED_AT < 720 )); do
-    H="$(healthy)"
-    if [[ "$H" == "$HOSTS" ]]; then echo "   fleet back to $H/$HOSTS healthy targets $((SECONDS - KILLED_AT)) s after the kill"; break; fi
-    echo "   utc=$(utc) healthy targets: $H/$HOSTS"
-    sleep 20
-  done
-  if [[ "$(healthy)" != "$HOSTS" ]]; then
-    echo "   THE REPLACEMENT HOST DID NOT ARRIVE. Last scaling activity:"
-    aws autoscaling describe-scaling-activities --auto-scaling-group-name "$ASG" --max-items 1 \
-      --query 'Activities[0].[StatusCode,StatusMessage]' --output text | cut -c1-300 | sed 's/^/   /'
-    echo "   The rest of the test runs on the hosts that are left."
-  fi
-
-fi
-
 echo
 echo "== C. stage 3 share for 90 s: every answer expected, within the fleet's capacity"
 start_client --rate "$(rate 21)" --seconds 90 --procs 2 --min-correct-share 0.99 --max-p99-ms 400
@@ -156,10 +123,35 @@ if [[ "$IDLE_HOSTS" == 0 && -n "$SHRUNK" ]]; then
   done
   client_output
   if [[ -n "$WOKE" ]]; then
-    echo "   FLEET ASKED TO START AGAIN about $WOKE s after requests came back (the hosts then need several minutes)"
+    echo "   FLEET ASKED TO START AGAIN about $WOKE s after requests came back"
+    echo "== waiting for the hosts to serve again (up to 15 minutes)"
+    while (( SECONDS - WAKE_START < 900 )); do
+      H="$(healthy)"
+      if [[ "$H" == "$HOSTS" ]]; then echo "   SERVICE BACK: $H/$HOSTS healthy targets $((SECONDS - WAKE_START)) s after requests came back"; break; fi
+      echo "   utc=$(utc) healthy targets: $H/$HOSTS"
+      sleep 20
+    done
   else
     echo "   THE FLEET WAS NOT STARTED AGAIN"
   fi
+fi
+
+# The host kill comes last: it leaves the group launching a replacement, and AWS refuses to shrink
+# a group that is launching. STAGING_KILL=0 skips it.
+if [[ "${STAGING_KILL:-1}" == 1 && "$(healthy)" == "$HOSTS" ]]; then
+  echo
+  echo "== G. stage 2 share for 150 s with one host terminated without notice after 45 s"
+  echo "   Told to stop, a task keeps answering while its health check fails: no request should be lost."
+  start_client --rate "$(rate 2.1)" --seconds 150 --windows
+  sleep 45
+  VICTIM="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)"
+  echo "KILL utc=$(utc) instance=$VICTIM"
+  aws ec2 terminate-instances --instance-ids "$VICTIM" --query 'TerminatingInstances[0].CurrentState.Name' --output text
+  for _ in $(seq 1 9); do sleep 10; echo "   utc=$(utc) healthy targets: $(healthy)/$HOSTS"; done
+  client_output
+  echo "   what the containers logged when they were told to stop (nothing here means they were not told):"
+  aws logs filter-log-events --log-group-name "/exam-run/r${RUN_ID}/inference" --filter-pattern '"stopp"' --max-items 50 \
+    --query 'events[].[timestamp,logStreamName,message]' --output text | tail -12 | cut -c1-200 | sed 's/^/   /'
 fi
 
 echo

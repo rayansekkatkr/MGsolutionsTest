@@ -1,0 +1,25 @@
+name: patch-image
+
+# The measured image with the current server code on top (inference/patch_image.sh).
+
+on:
+  push:
+    branches: [round3-inference-image]
+    paths: [inference/patch_base.txt, inference/patch_image.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Publish the image with the current server code
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash inference/patch_image.sh

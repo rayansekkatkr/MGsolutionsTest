@@ -45,6 +45,12 @@ Parameters:
     Type: Number
     Default: 3
     Description: Requests that may wait for the GPU in one inference server (one more than a batch)
+  DrainSeconds:
+    Type: Number
+    Default: 20
+    Description: >-
+      Seconds a task keeps answering after it is told to stop, while its health check already
+      fails. The load balancer needs up to 10 s to take the task out
   Workers:
     Type: Number
     Default: 1
@@ -197,6 +203,7 @@ Resources:
         - Name: inference
           Image: !Ref ImageInference
           Essential: true
+          StopTimeout: 40
           Cpu: 3072
           Environment:
             - {Name: PRECISION, Value: fp16}
@@ -206,6 +213,7 @@ Resources:
             # away the requests a batch leaves behind instead of answering them late.
             - {Name: MAX_WAITING, Value: !Ref MaxWaiting}
             - {Name: WORKERS, Value: !Ref Workers}
+            - {Name: DRAIN_S, Value: !Ref DrainSeconds}
             # The numeric libraries start one thread per CPU and let idle threads spin. That kept
             # all four CPUs busy for nothing (396% measured, 126% with these settings) and cost
             # 8% of the photos served. One thread each, and no spinning.
@@ -247,6 +255,7 @@ Resources:
         - Name: proxy
           Image: !Ref ImageHaproxy
           Essential: true
+          StopTimeout: 40
           Cpu: 512
           User: "99"
           ReadonlyRootFilesystem: true
@@ -259,9 +268,27 @@ Resources:
             Capabilities: {Drop: [ALL]}
             Tmpfs: [{ContainerPath: /tmp, Size: 16, MountOptions: [rw, nosuid, nodev]}]
           EntryPoint: [sh, -c]
+          # When the task is told to stop, the proxy stays up a little longer than the inference
+          # server keeps answering (see DRAIN_S there), and is started again if something stops
+          # it from outside meanwhile, as a host shutting down may do.
           Command:
-            - printf '%s\n' "$HAPROXY_CFG" > /tmp/haproxy.cfg && exec haproxy -db -f /tmp/haproxy.cfg
+            - |
+              printf '%s\n' "$HAPROXY_CFG" > /tmp/haproxy.cfg || exit 1
+              start() { haproxy -db -f /tmp/haproxy.cfg & pid=$!; }
+              trap 'if [ -z "$stopping" ]; then stopping=1; echo "stopping: the proxy stays up for $((DRAIN_S + 3)) s"; (sleep $((DRAIN_S + 3)); kill -USR2 $$) & fi' TERM
+              trap 'kill $pid 2>/dev/null; exit 0' USR2
+              start
+              restarts=0
+              while :; do
+                wait $pid; code=$?
+                kill -0 $pid 2>/dev/null && continue
+                [ -n "$stopping" ] || exit $code
+                restarts=$((restarts + 1)); [ $restarts -gt 20 ] && exit 1
+                echo "stopping: the proxy was stopped from outside, started again"
+                start
+              done
           Environment:
+            - {Name: DRAIN_S, Value: !Ref DrainSeconds}
             - Name: HAPROXY_CFG
               Value: !Sub |
                 global
