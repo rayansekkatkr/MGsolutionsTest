@@ -55,11 +55,20 @@ INFERENCE_IMAGE="$REGISTRY/exam-staging/inference:candidate"
 "$CRANE" copy --platform linux/amd64 "public.ecr.aws/docker/library/haproxy:$HAPROXY_TAG" "$HAPROXY_IMAGE" >/dev/null
 "$CRANE" copy --platform linux/amd64 "public.ecr.aws/docker/library/python:3.12-slim" "$PYTHON_IMAGE" >/dev/null
 echo "   inference image: $INFERENCE_SOURCE"
-if ! "$CRANE" copy "$INFERENCE_SOURCE" "$INFERENCE_IMAGE" >/dev/null; then
+# The exam reads the image without logging in, so check exactly that first.
+if ! DOCKER_CONFIG="$(mktemp -d)" "$CRANE" digest "$INFERENCE_SOURCE" >/dev/null 2>&1; then
   echo "Could not read $INFERENCE_SOURCE without logging in. The exam needs it public as well:"
   echo "GitHub > your profile > Packages > mgsolutionstest-inference > Package settings > Change visibility > Public"
   exit 1
 fi
+echo "   readable without logging in: yes"
+# 13 GB over the internet: an upload is sometimes cut. What is already copied is kept.
+for attempt in 1 2 3 4; do
+  if "$CRANE" copy "$INFERENCE_SOURCE" "$INFERENCE_IMAGE" >/dev/null; then break; fi
+  if [[ "$attempt" == 4 ]]; then echo "The copy into the private registry failed four times (network). Run staging/up.sh again."; exit 1; fi
+  echo "   the copy was interrupted (network); trying again, attempt $((attempt + 1)) of 4"
+  sleep 5
+done
 INFERENCE_IMAGE="$REGISTRY/exam-staging/inference@$("$CRANE" digest "$INFERENCE_IMAGE")"
 echo "   copied as $INFERENCE_IMAGE"
 
